@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AutoSender</string>
+    <string name="accessibility_service_description">This service is used to automate USSD menu navigation for sending money automatically.</string>
+</resources>

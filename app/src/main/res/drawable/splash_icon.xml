@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer circle -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,54 m-42,0 a42,42 0 1,0 84,0 a42,42 0 1,0 -84,0" />
+    <!-- Letter M -->
+    <path
+        android:fillColor="#2E7D32"
+        android:pathData="M28,72 L28,36 L40,36 L54,58 L68,36 L80,36 L80,72 L70,72 L70,52 L57,72 L51,72 L38,52 L38,72 Z" />
+</vector>
