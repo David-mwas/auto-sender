@@ -100,4 +100,48 @@ class LogsManager(context: Context) {
             (contactId == null || it.contactId == contactId)
         }.sumOf { it.amount!! }
     }
+
+    /**
+     * Exports all logs as a CSV string.
+     * Columns: Date, Time, Status, Message, Details, Amount (KES), Contact ID
+     */
+    fun exportLogsAsCsv(): String {
+        val logs = getLogs()
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+        val sb = StringBuilder()
+        sb.appendLine("\"Date & Time\",\"Status\",\"Message\",\"Details\",\"Amount (KES)\",\"Contact ID\"")
+        for (log in logs) {
+            val date = sdf.format(java.util.Date(log.timestamp))
+            val status = log.status.name
+            val message = log.message.replace("\"", "'")
+            val details = log.contextDetails.replace("\"", "'").replace("\n", " ")
+            val amount = if (log.amount != null) "%.2f".format(log.amount) else ""
+            val contactId = log.contactId ?: ""
+            sb.appendLine("\"$date\",\"$status\",\"$message\",\"$details\",\"$amount\",\"$contactId\"")
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Exports all logs as a human-readable plain-text report.
+     */
+    fun exportLogsAsText(): String {
+        val logs = getLogs()
+        val sdf = java.text.SimpleDateFormat("EEE, dd MMM yyyy  HH:mm:ss", java.util.Locale.getDefault())
+        val sb = StringBuilder()
+        sb.appendLine("AutoSender – Transaction Log Export")
+        sb.appendLine("Generated: ${sdf.format(java.util.Date())}")
+        sb.appendLine("Total records: ${logs.size}")
+        sb.appendLine("=".repeat(50))
+        sb.appendLine()
+        for (log in logs) {
+            sb.appendLine("[${log.status}]  ${sdf.format(java.util.Date(log.timestamp))}")
+            sb.appendLine("  Message : ${log.message}")
+            if (log.amount != null) sb.appendLine("  Amount  : KES ${"%.2f".format(log.amount)}")
+            if (!log.contextDetails.isNullOrBlank() && log.contextDetails != log.message)
+                sb.appendLine("  Details : ${log.contextDetails}")
+            sb.appendLine("-".repeat(50))
+        }
+        return sb.toString()
+    }
 }

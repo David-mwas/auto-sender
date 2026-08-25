@@ -12,11 +12,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -43,14 +45,17 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -187,6 +192,28 @@ class MainActivity : FragmentActivity() {
         biometricPrompt.authenticate(promptInfo)
     }
 
+    /**
+     * Checks if a screen recording / cast is currently active.
+     * Android restricts USSD dialog visibility during recording for security reasons,
+     * which can prevent the accessibility service from reading and interacting with
+     * the M-PESA USSD dialog.
+     */
+    private fun isScreenBeingRecorded(): Boolean {
+        return try {
+            val mediaProjectionManager = getSystemService(android.media.projection.MediaProjectionManager::class.java)
+            // The most reliable way: check if any MediaProjection is active via Android API
+            // We use the display flags as a proxy — FLAG_SECURE prevents screenshots/recording
+            val wm = getSystemService(android.view.WindowManager::class.java)
+            // Alternative: check if screen mirroring is active via DisplayManager
+            val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+            val displays = dm?.displays ?: emptyArray()
+            // Virtual displays (type VIRTUAL) indicate screen recording/mirroring is active
+            displays.any { it.displayId != android.view.Display.DEFAULT_DISPLAY }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private fun initiateTransfer(contact: Contact, amount: String) {
         val pin = SecurityHelper.getPin(this)
         if (pin.isNullOrEmpty()) {
@@ -196,6 +223,15 @@ class MainActivity : FragmentActivity() {
         if (!isAccessibilityServiceEnabled()) {
             Toast.makeText(this, "Please enable AutoSender in Accessibility Settings", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            return
+        }
+        // Warn user if screen recording is active — Android security blocks USSD dialog during recording
+        if (isScreenBeingRecorded()) {
+            Toast.makeText(
+                this,
+                "⚠️ Screen recording detected! Please stop recording before sending. Android blocks M-PESA USSD dialogs during screen recording for security.",
+                Toast.LENGTH_LONG
+            ).show()
             return
         }
         val txPrefs = getSharedPreferences("TxPrefs", Context.MODE_PRIVATE)
@@ -487,16 +523,41 @@ fun HomeTab(
         Column(modifier = Modifier.fillMaxSize()) {
             // Header
         val isDark = isSystemInDarkTheme()
-        val headerGradient = if (isDark) listOf(Color(0xFF0D1F0D), Color(0xFF1B3A1B)) else listOf(Color(0xFF2E7D32), Color(0xFF43A047))
+        val headerGradient = if (isDark)
+            Brush.linearGradient(
+                colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
+        else
+            Brush.linearGradient(
+                colors = listOf(GradientStart, GradientMid, GradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Brush.verticalGradient(headerGradient))
+                .background(headerGradient)
+                .statusBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 20.dp)
         ) {
+            // Decorative circle top-right
+            Box(
+                modifier = Modifier
+                    .size(180.dp)
+                    .offset(x = 80.dp, y = (-60).dp)
+                    .align(Alignment.TopEnd)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.04f))
+            )
             Column {
-                Text("AutoSender", style = MaterialTheme.typography.titleSmall, color = Color.White.copy(alpha = 0.8f))
-                Text("Send Money", style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier.size(8.dp).clip(CircleShape).background(MpesaAccentGreen)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("AutoSender", style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.85f), letterSpacing = 1.sp)
+                }
+                Text("Send Money", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
                 Spacer(modifier = Modifier.height(20.dp))
                 VirtualCreditCard(totalToday = totalToday, totalAllTime = totalAllTime)
             }
@@ -630,47 +691,101 @@ fun ContactCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val lastTx = remember(contact, refreshTrigger) { logsManager.getLogs().firstOrNull { it.contactId == contact.id } }
+    val lastTx = remember(contact, refreshTrigger) {
+        logsManager.getLogs().firstOrNull { it.contactId == contact.id && it.status == LogStatus.SUCCESS }
+    }
     val initials = contact.name.split(" ").take(2).joinToString("") { it.firstOrNull()?.toString() ?: "" }.uppercase()
 
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.97f else 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessHigh),
+        label = "card_scale"
+    )
+    val elevation by animateDpAsState(
+        targetValue = if (isPressed) 1.dp else 4.dp,
+        animationSpec = tween(150),
+        label = "card_elevation"
+    )
+
+    // Avatar gradient - each contact gets a deterministic color based on initials
+    val avatarHue = (initials.hashCode().and(0xFF) / 255f) * 120f + 90f // greens 90-210
+    val avatarColor1 = Color.hsv(avatarHue, 0.65f, 0.7f)
+    val avatarColor2 = Color.hsv((avatarHue + 30f) % 360f, 0.75f, 0.55f)
+
     Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(scale)
+            .shadow(elevation, RoundedCornerShape(18.dp))
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp)
+        shape = RoundedCornerShape(18.dp)
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Avatar with initials
+            // Gradient avatar
             Box(
                 modifier = Modifier
-                    .size(52.dp)
+                    .size(54.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
+                    .background(Brush.radialGradient(listOf(avatarColor1, avatarColor2))),
                 contentAlignment = Alignment.Center
             ) {
-                Text(initials, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Bold)
+                Text(
+                    initials,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
             }
             Spacer(modifier = Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(contact.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(contact.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                 Text(contact.phoneNumber, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (lastTx != null && lastTx.amount != null) {
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        "Last: KES ${"%.0f".format(lastTx.amount)} • ${SimpleDateFormat("MMM dd", Locale.getDefault()).format(Date(lastTx.timestamp))}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(SuccessGreen.copy(alpha = 0.10f))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Icon(Icons.Default.CheckCircle, null, tint = SuccessGreen, modifier = Modifier.size(10.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            "Last: KES ${"%.0f".format(lastTx.amount)} · ${SimpleDateFormat("MMM dd", Locale.getDefault()).format(Date(lastTx.timestamp))}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SuccessGreen
+                        )
+                    }
                 }
             }
-            IconButton(onClick = onEdit, modifier = Modifier.size(36.dp)) {
-                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            // Action buttons with subtle backgrounds
+            IconButton(
+                onClick = onEdit,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
             }
-            IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
-                Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(ErrorRed.copy(alpha = 0.10f))
+            ) {
+                Icon(Icons.Default.Delete, null, tint = ErrorRed, modifier = Modifier.size(16.dp))
             }
         }
     }
@@ -727,55 +842,104 @@ fun ContactDetailScreen(
         Column(modifier = Modifier.fillMaxSize()) {
             // Gradient Header
         val isDark = isSystemInDarkTheme()
-        val headerGradient = if (isDark) listOf(Color(0xFF0D1F0D), Color(0xFF1B3A1B)) else listOf(Color(0xFF2E7D32), Color(0xFF43A047))
+        val headerGradient = if (isDark)
+            Brush.linearGradient(
+                colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
+        else
+            Brush.linearGradient(
+                colors = listOf(GradientStart, GradientMid, GradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
+        val avatarHue = (initials.hashCode().and(0xFF) / 255f) * 120f + 90f
+        val avatarColor1 = Color.hsv(avatarHue, 0.65f, 0.7f)
+        val avatarColor2 = Color.hsv((avatarHue + 30f) % 360f, 0.75f, 0.55f)
+
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Brush.verticalGradient(headerGradient))
+                .background(headerGradient)
+                .statusBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
+            // Decorative circles
+            Box(modifier = Modifier.size(200.dp).offset(x = 60.dp, y = (-80).dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.White.copy(alpha = 0.04f)))
+            Box(modifier = Modifier.size(100.dp).offset(x = (-30).dp, y = 20.dp).align(Alignment.BottomStart).clip(CircleShape).background(Color.White.copy(alpha = 0.03f)))
+
             Column(modifier = Modifier.fillMaxWidth()) {
-                IconButton(onClick = onBack, modifier = Modifier.size(36.dp).offset(x = (-8).dp)) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(GlassWhite12)
+                ) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White)
                 }
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
-                            .size(64.dp)
+                            .size(72.dp)
                             .clip(CircleShape)
-                            .background(Color.White.copy(alpha = 0.15f)),
+                            .background(Brush.radialGradient(listOf(avatarColor1, avatarColor2)))
+                            .border(2.dp, Color.White.copy(alpha = 0.3f), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(initials, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                     Spacer(modifier = Modifier.width(16.dp))
                     Column {
-                        Text(contact.name, style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
-                        Text(contact.phoneNumber, style = MaterialTheme.typography.bodyLarge, color = Color.White.copy(alpha = 0.8f))
-                    }
-                }
-                Spacer(modifier = Modifier.height(24.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Column {
-                        Text("Sent Today", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.8f))
-                        Text("KES ${"%.2f".format(totalToday)}", style = MaterialTheme.typography.titleLarge, color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text("All Time", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.8f))
-                        Text("KES ${"%.2f".format(totalAllTime)}", style = MaterialTheme.typography.titleLarge, color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(contact.name, style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.ExtraBold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Phone, null, tint = MpesaAccentGreen, modifier = Modifier.size(12.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(contact.phoneNumber, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.8f))
+                        }
                     }
                 }
                 Spacer(modifier = Modifier.height(20.dp))
+                // Stats row
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // Today
+                    Box(
+                        modifier = Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(GlassWhite12).padding(12.dp)
+                    ) {
+                        Column {
+                            Text("SENT TODAY", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.7f), letterSpacing = 0.8.sp)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("KES ${"%.2f".format(totalToday)}", style = MaterialTheme.typography.titleMedium, color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    // All time
+                    Box(
+                        modifier = Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(GlassWhite12).padding(12.dp)
+                    ) {
+                        Column {
+                            Text("ALL TIME", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.7f), letterSpacing = 0.8.sp)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("KES ${"%.2f".format(totalAllTime)}", style = MaterialTheme.typography.titleMedium, color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                // Animated Send Button
+                val sendInteraction = remember { MutableInteractionSource() }
+                val isSendPressed by sendInteraction.collectIsPressedAsState()
+                val sendScale by animateFloatAsState(
+                    targetValue = if (isSendPressed) 0.96f else 1f,
+                    animationSpec = spring(Spring.DampingRatioMediumBouncy),
+                    label = "send_scale"
+                )
                 Button(
                     onClick = { showSendDialog = true },
-                    modifier = Modifier.fillMaxWidth().height(52.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFF2E7D32))
+                    modifier = Modifier.fillMaxWidth().height(54.dp).scale(sendScale),
+                    shape = RoundedCornerShape(16.dp),
+                    interactionSource = sendInteraction,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = GradientStart),
+                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp, pressedElevation = 1.dp)
                 ) {
-                    Icon(Icons.Default.SendTimeExtension, null, modifier = Modifier.size(20.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Send Money", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Icon(Icons.Default.SendTimeExtension, null, modifier = Modifier.size(22.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("Send Money", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
                 }
             }
         }
@@ -844,11 +1008,14 @@ fun ContactDetailScreen(
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterialApi::class)
 @Composable
 fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
+    val context = LocalContext.current
     var allLogs by remember { mutableStateOf(logsManager.getLogs()) }
     var searchQuery by remember { mutableStateOf("") }
     var filterStatus by remember { mutableStateOf<LogStatus?>(null) }
     var selectedLog by remember { mutableStateOf<TransactionLog?>(null) }
-    
+    var showClearConfirm by remember { mutableStateOf(false) }
+    var showExportDialog by remember { mutableStateOf(false) }
+
     LaunchedEffect(refreshTrigger) {
         allLogs = logsManager.getLogs()
     }
@@ -888,16 +1055,71 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
         Column(modifier = Modifier.fillMaxSize()) {
             // Header
         val isDark = isSystemInDarkTheme()
-        val headerGradient = if (isDark) listOf(Color(0xFF0D1F0D), Color(0xFF1B3A1B)) else listOf(Color(0xFF2E7D32), Color(0xFF43A047))
+        val headerGradient = if (isDark)
+            Brush.linearGradient(
+                colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
+        else
+            Brush.linearGradient(
+                colors = listOf(GradientStart, GradientMid, GradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Brush.verticalGradient(headerGradient))
+                .background(headerGradient)
+                .statusBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
-            Column {
-                Text("Transaction Logs", style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
-                Text("${filteredLogs.size} of ${allLogs.size} records", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.8f))
+            // Decorative circle
+            Box(modifier = Modifier.size(140.dp).offset(x = 40.dp, y = (-40).dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.White.copy(alpha = 0.04f)))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(MpesaAccentGreen))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("AutoSender", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.7f), letterSpacing = 0.8.sp)
+                    }
+                    Text("Transaction Logs", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
+                    Text("${filteredLogs.size} of ${allLogs.size} records", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.75f))
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // Export button
+                    IconButton(
+                        onClick = { showExportDialog = true },
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.White.copy(alpha = 0.15f))
+                    ) {
+                        Icon(
+                            Icons.Default.Share,
+                            contentDescription = "Export Logs",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    // Clear logs button
+                    IconButton(
+                        onClick = { showClearConfirm = true },
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFFB71C1C).copy(alpha = 0.3f))
+                    ) {
+                        Icon(
+                            Icons.Default.DeleteForever,
+                            contentDescription = "Clear All Logs",
+                            tint = Color(0xFFFF8A80),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
             }
         }
 
@@ -949,6 +1171,159 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
     if (selectedLog != null) {
         LogDetailDialog(log = selectedLog!!, onDismiss = { selectedLog = null })
     }
+
+    // ── Clear confirmation dialog ──────────────────────────────────────────
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            icon = {
+                Box(
+                    modifier = Modifier.size(56.dp).clip(CircleShape).background(ErrorRed.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.DeleteForever, null, tint = ErrorRed, modifier = Modifier.size(32.dp))
+                }
+            },
+            title = { Text("Clear All Logs?", fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) },
+            text = {
+                Text(
+                    "This will permanently delete all ${allLogs.size} transaction records. This action cannot be undone.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        logsManager.clearLogs()
+                        allLogs = emptyList()
+                        showClearConfirm = false
+                        Toast.makeText(context, "All logs cleared", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(Icons.Default.DeleteForever, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Yes, Clear All", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { showClearConfirm = false },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) { Text("Cancel") }
+            }
+        )
+    }
+
+    // ── Export format chooser dialog ───────────────────────────────────────
+    if (showExportDialog) {
+        AlertDialog(
+            onDismissRequest = { showExportDialog = false },
+            icon = {
+                Box(
+                    modifier = Modifier.size(56.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Share, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(28.dp))
+                }
+            },
+            title = { Text("Export Logs", fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Choose an export format. The file will open in your share sheet so you can send it via WhatsApp, email, Drive, etc.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    // CSV option
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            showExportDialog = false
+                            shareLogs(context, logsManager.exportLogsAsCsv(), "autosender_logs.csv", "text/csv")
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.TableChart, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text("CSV Spreadsheet", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                Text("Open in Excel, Google Sheets, etc.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+                        }
+                    }
+                    // Plain text option
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            showExportDialog = false
+                            shareLogs(context, logsManager.exportLogsAsText(), "autosender_logs.txt", "text/plain")
+                        },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondaryContainer),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.TextSnippet, null, tint = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text("Plain Text Report", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                Text("Human-readable, share via WhatsApp/email", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showExportDialog = false }, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+/**
+ * Writes the given log content to a temp file and opens Android's share sheet.
+ * Uses FileProvider so no WRITE_EXTERNAL_STORAGE permission is needed.
+ */
+fun shareLogs(context: android.content.Context, content: String, fileName: String, mimeType: String) {
+    try {
+        val exportDir = java.io.File(context.cacheDir, "exports").also { it.mkdirs() }
+        val file = java.io.File(exportDir, fileName)
+        file.writeText(content)
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context, "${context.packageName}.fileprovider", file
+        )
+        val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "AutoSender Transaction Logs")
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(android.content.Intent.createChooser(intent, "Export logs via…"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+    }
 }
 
 @Composable
@@ -968,7 +1343,7 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
     val statusColor = when (log.status) {
         LogStatus.SUCCESS -> SuccessGreen
         LogStatus.FAILED -> ErrorRed
-        LogStatus.ERROR -> Color(0xFFE65100)
+        LogStatus.ERROR -> Color(0xFFFF6D00)
         LogStatus.INFO -> InfoBlue
     }
     val statusIcon = when (log.status) {
@@ -977,49 +1352,96 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
         LogStatus.ERROR -> Icons.Default.Warning
         LogStatus.INFO -> Icons.Default.Info
     }
+    val statusLabel = when (log.status) {
+        LogStatus.SUCCESS -> "Success"
+        LogStatus.FAILED -> "Failed"
+        LogStatus.ERROR -> "Error"
+        LogStatus.INFO -> "Info"
+    }
+
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.98f else 1f,
+        animationSpec = spring(Spring.DampingRatioMediumBouncy),
+        label = "log_scale"
+    )
+
     Card(
-        modifier = Modifier.fillMaxWidth().then(
-            if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
-        ),
-        elevation = CardDefaults.cardElevation(2.dp),
-        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(scale)
+            .then(if (onClick != null) Modifier.clickable(interactionSource = interactionSource, indication = null, onClick = onClick) else Modifier),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Row(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.Top) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+            // Left colored accent bar
             Box(
-                modifier = Modifier.size(40.dp).clip(CircleShape).background(statusColor.copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(statusIcon, null, tint = statusColor, modifier = Modifier.size(22.dp))
-            }
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                val logDate = Calendar.getInstance().apply { timeInMillis = log.timestamp }
-                val today = Calendar.getInstance()
-                val dateString = when {
-                    logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) -> "Today"
-                    logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) - 1 -> "Yesterday"
-                    else -> SimpleDateFormat("EEEE", Locale.getDefault()).format(Date(log.timestamp))
-                }
-                
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        if (log.amount != null) "$dateString - Sent KES ${"%.0f".format(log.amount)}" else "$dateString - ${log.status.name.lowercase().capitalize()}",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.Bold
+                modifier = Modifier
+                    .width(4.dp)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(topStart = 16.dp, bottomStart = 16.dp))
+                    .background(
+                        Brush.verticalGradient(listOf(statusColor, statusColor.copy(alpha = 0.4f)))
                     )
-                    Text(
-                        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(log.timestamp)),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    .defaultMinSize(minHeight = 70.dp)
+            )
+            Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.Top) {
+                // Status icon with colored bg
+                Box(
+                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)).background(statusColor.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(statusIcon, null, tint = statusColor, modifier = Modifier.size(22.dp))
                 }
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(log.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
-            }
-            if (onClick != null) {
-                Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f), modifier = Modifier.size(18.dp).align(Alignment.CenterVertically))
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    val logDate = Calendar.getInstance().apply { timeInMillis = log.timestamp }
+                    val today = Calendar.getInstance()
+                    val dateString = when {
+                        logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) -> "Today"
+                        logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) - 1 -> "Yesterday"
+                        else -> SimpleDateFormat("EEE, MMM dd", Locale.getDefault()).format(Date(log.timestamp))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Title
+                        Text(
+                            if (log.amount != null) "$dateString · KES ${"%.0f".format(log.amount)}" else "$dateString · ${log.message}",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        // Status pill badge
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(statusColor.copy(alpha = 0.13f))
+                                .padding(horizontal = 7.dp, vertical = 2.dp)
+                        ) {
+                            Text(statusLabel, style = MaterialTheme.typography.labelSmall, color = statusColor, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        Text(log.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                        Text(
+                            SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(log.timestamp)),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+                if (onClick != null) {
+                    Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f), modifier = Modifier.size(18.dp).align(Alignment.CenterVertically))
+                }
             }
         }
     }
@@ -1111,16 +1533,31 @@ fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit) {
 
     Column(modifier = Modifier.fillMaxSize()) {
         val isDark = isSystemInDarkTheme()
-        val headerGradient = if (isDark) listOf(Color(0xFF0D1F0D), Color(0xFF1B3A1B)) else listOf(Color(0xFF2E7D32), Color(0xFF43A047))
+        val headerGradient = if (isDark)
+            Brush.linearGradient(
+                colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
+        else
+            Brush.linearGradient(
+                colors = listOf(GradientStart, GradientMid, GradientEnd),
+                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+            )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Brush.verticalGradient(headerGradient))
+                .background(headerGradient)
+                .statusBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
+            Box(modifier = Modifier.size(160.dp).offset(x = 50.dp, y = (-50).dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.White.copy(alpha = 0.04f)))
             Column {
-                Text("Settings", style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
-                Text("Customize your AutoSender experience", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.8f))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(MpesaAccentGreen))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("AutoSender", style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.7f), letterSpacing = 1.sp)
+                }
+                Text("Settings", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
             }
         }
 
@@ -1364,20 +1801,84 @@ fun TransactionResultModal(result: TransactionResult, onDismiss: () -> Unit) {
 // ─────────────────────────────────────────────
 @Composable
 fun EmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String) {
+    // Infinite pulsing animation for the icon ring
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1400, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_scale"
+    )
+    val glowAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.06f,
+        targetValue = 0.18f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1400, easing = EaseInOutSine),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glow_alpha"
+    )
+
     Column(
         modifier = Modifier.fillMaxWidth().padding(48.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(
-            modifier = Modifier.size(80.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(40.dp))
+        Box(contentAlignment = Alignment.Center) {
+            // Outer glow ring
+            Box(
+                modifier = Modifier
+                    .size(110.dp)
+                    .scale(pulse)
+                    .clip(CircleShape)
+                    .background(
+                        Brush.radialGradient(
+                            listOf(
+                                MaterialTheme.colorScheme.primary.copy(alpha = glowAlpha),
+                                Color.Transparent
+                            )
+                        )
+                    )
+            )
+            // Icon container
+            Box(
+                modifier = Modifier
+                    .size(80.dp)
+                    .clip(CircleShape)
+                    .background(
+                        Brush.radialGradient(
+                            listOf(
+                                MaterialTheme.colorScheme.primaryContainer,
+                                MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    icon, null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(40.dp)
+                )
+            }
         }
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+        Spacer(modifier = Modifier.height(20.dp))
+        Text(
+            title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            subtitle,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            lineHeight = 18.sp
+        )
     }
 }
 
@@ -1476,12 +1977,22 @@ fun QuickSendDialog(
 
 @Composable
 fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
+    // Animate a shimmer sweep across the card
+    val shimmerTransition = rememberInfiniteTransition(label = "shimmer")
+    val shimmerOffset by shimmerTransition.animateFloat(
+        initialValue = -1f,
+        targetValue = 2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2800, easing = LinearEasing, delayMillis = 1200),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmer_x"
+    )
+
     Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(200.dp),
-        shape = RoundedCornerShape(20.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+        modifier = Modifier.fillMaxWidth().height(196.dp),
+        shape = RoundedCornerShape(24.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent)
     ) {
         Box(
@@ -1490,66 +2001,111 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                 .background(
                     Brush.linearGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = 0.25f),
-                            Color.White.copy(alpha = 0.05f)
+                            Color.White.copy(alpha = 0.22f),
+                            Color.White.copy(alpha = 0.10f),
+                            Color.White.copy(alpha = 0.18f)
                         ),
-                        start = androidx.compose.ui.geometry.Offset(0f, 0f),
-                        end = androidx.compose.ui.geometry.Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+                        start = Offset(0f, 0f),
+                        end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
                     )
                 )
                 .border(
-                    width = 1.dp,
+                    width = 1.5.dp,
                     brush = Brush.linearGradient(
-                        listOf(Color.White.copy(alpha = 0.4f), Color.White.copy(alpha = 0.05f))
+                        listOf(
+                            Color.White.copy(alpha = 0.6f),
+                            Color.White.copy(alpha = 0.08f),
+                            Color.White.copy(alpha = 0.35f)
+                        )
                     ),
-                    shape = RoundedCornerShape(20.dp)
+                    shape = RoundedCornerShape(24.dp)
                 )
-                .padding(24.dp)
         ) {
+            // Decorative circles
+            Box(
+                modifier = Modifier.size(160.dp).offset(x = 180.dp, y = (-40).dp)
+                    .clip(CircleShape).background(Color.White.copy(alpha = 0.04f))
+            )
+            Box(
+                modifier = Modifier.size(100.dp).offset(x = (-20).dp, y = 100.dp)
+                    .clip(CircleShape).background(Color.White.copy(alpha = 0.04f))
+            )
+            // Shimmer sweep overlay
+            Box(
+                modifier = Modifier.fillMaxSize().background(
+                    Brush.linearGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color.White.copy(alpha = 0.08f),
+                            Color.Transparent
+                        ),
+                        start = Offset(shimmerOffset * 600f, 0f),
+                        end = Offset(shimmerOffset * 600f + 200f, Float.POSITIVE_INFINITY)
+                    )
+                )
+            )
             Column(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().padding(22.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Top Row
+                // Top row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "AutoSender",
-                        color = Color.White.copy(alpha = 0.8f),
-                        style = MaterialTheme.typography.labelLarge,
-                        letterSpacing = 2.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Column {
+                        Text(
+                            text = "AUTOSENDER",
+                            color = Color.White.copy(alpha = 0.65f),
+                            style = MaterialTheme.typography.labelSmall,
+                            letterSpacing = 2.sp
+                        )
+                        Text(
+                            text = "M-PESA",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.sp,
+                            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                        )
+                    }
                     Icon(
-                        imageVector = Icons.Default.Nfc, // NFC/Contactless style
-                        contentDescription = "Virtual Card",
-                        tint = Color.White.copy(alpha = 0.8f),
-                        modifier = Modifier.size(28.dp)
+                        imageVector = Icons.Default.Nfc,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.75f),
+                        modifier = Modifier.size(30.dp)
                     )
                 }
-                
-                // Middle Row (Balance)
+                // Center – total sent amount
                 Column {
                     Text(
                         text = "TOTAL SENT",
-                        color = Color.White.copy(alpha = 0.7f),
+                        color = Color.White.copy(alpha = 0.65f),
                         style = MaterialTheme.typography.labelSmall,
-                        letterSpacing = 1.sp
+                        letterSpacing = 1.2.sp
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         text = "KES %,.2f".format(totalAllTime),
                         color = Color.White,
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.ExtraBold,
-                        letterSpacing = 1.sp
+                        letterSpacing = 0.5.sp
+                    )
+                    // Mint accent underline
+                    Box(
+                        modifier = Modifier
+                            .width(64.dp).height(2.dp)
+                            .clip(CircleShape)
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(MpesaAccentGreen, MpesaAccentGreen.copy(alpha = 0f))
+                                )
+                            )
                     )
                 }
-                
-                // Bottom Row
+                // Bottom row – today
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1558,11 +2114,11 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                     Column {
                         Text(
                             text = "TODAY",
-                            color = Color.White.copy(alpha = 0.7f),
+                            color = Color.White.copy(alpha = 0.65f),
                             style = MaterialTheme.typography.labelSmall,
                             letterSpacing = 1.sp
                         )
-                        Spacer(modifier = Modifier.height(4.dp))
+                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
                             text = "KES %,.2f".format(totalToday),
                             color = Color.White,
@@ -1570,14 +2126,21 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                             fontWeight = FontWeight.Bold
                         )
                     }
-                    
-                    Text(
-                        text = "M-PESA",
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Black,
-                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
-                    )
+                    // Chip-style safaricom badge
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MpesaAccentGreen.copy(alpha = 0.25f))
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "SAFARICOM",
+                            color = MpesaAccentGreen,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.sp
+                        )
+                    }
                 }
             }
         }

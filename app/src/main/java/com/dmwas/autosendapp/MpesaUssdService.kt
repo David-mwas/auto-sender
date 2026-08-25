@@ -152,21 +152,81 @@ class MpesaUssdService : AccessibilityService() {
                         actionTaken = false
                     }
                 }
-            } else if (dialogText.contains("success") || dialogText.contains("received") || dialogText.contains("failed") || dialogText.contains("request is being processed") || dialogText.contains("wait for an sms")) {
-                val status = if (dialogText.contains("failed") || dialogText.contains("error")) LogStatus.FAILED else LogStatus.SUCCESS
-                val msg = if (status == LogStatus.SUCCESS) "Transaction successful. Please check SMS for confirmation." else "Transaction failed. Please check SMS for details."
+            } else if (
+                dialogText.contains("transfer successful") ||
+                dialogText.contains("you have sent") ||
+                dialogText.contains("sent to") ||
+                dialogText.contains("m-pesa confirmed") ||
+                (dialogText.contains("success") && (dialogText.contains("ksh") || dialogText.contains("kes") || dialogText.contains("sent"))) ||
+                dialogText.contains("failed") ||
+                dialogText.contains("request is being processed") ||
+                dialogText.contains("wait for an sms") ||
+                dialogText.contains("wait for sms") ||
+                dialogText.contains("wait for a confirmation")
+            ) {
+                // Determine if this is a definitive M-PESA success (actual money sent confirmation)
+                val isDefinitiveSuccess = dialogText.contains("transfer successful") ||
+                    dialogText.contains("you have sent") ||
+                    (dialogText.contains("sent to") && (dialogText.contains("ksh") || dialogText.contains("kes"))) ||
+                    dialogText.contains("m-pesa confirmed") ||
+                    (dialogText.contains("success") && (dialogText.contains("ksh") || dialogText.contains("kes")))
                 
-                logsManager.addLog(status, "Transaction Completed", dialogText, amountDouble, contactId)
+                // "Request being processed" / "wait for sms" = pending, NOT a confirmed success
+                // Only log amount on definitive success; pending = INFO with no amount
+                val isPending = dialogText.contains("request is being processed") ||
+                    dialogText.contains("wait for an sms") ||
+                    dialogText.contains("wait for sms") ||
+                    dialogText.contains("wait for a confirmation")
                 
-                TransactionEventBus.emit(TransactionResult(
-                    success = status == LogStatus.SUCCESS,
-                    message = msg,
-                    amount = amountDouble,
-                    contactName = contactName ?: phoneNumber
-                ))
+                val isFailure = dialogText.contains("failed") || dialogText.contains("error")
                 
-                if (buttonNode != null) clickNode(buttonNode!!)
-                endSession(this@MpesaUssdService)
+                when {
+                    isFailure -> {
+                        logsManager.addLog(LogStatus.FAILED, "Transaction Failed", dialogText, null, contactId)
+                        TransactionEventBus.emit(TransactionResult(
+                            success = false,
+                            message = "Transaction failed. Please check SMS for details.",
+                            amount = null,
+                            contactName = contactName ?: phoneNumber
+                        ))
+                        if (buttonNode != null) clickNode(buttonNode!!)
+                        endSession(this@MpesaUssdService)
+                    }
+                    isDefinitiveSuccess -> {
+                        logsManager.addLog(LogStatus.SUCCESS, "Transaction Completed", dialogText, amountDouble, contactId)
+                        TransactionEventBus.emit(TransactionResult(
+                            success = true,
+                            message = "Transfer successful! Please check SMS for confirmation. Auto-closes in 60s",
+                            amount = amountDouble,
+                            contactName = contactName ?: phoneNumber
+                        ))
+                        if (buttonNode != null) clickNode(buttonNode!!)
+                        endSession(this@MpesaUssdService)
+                    }
+                    isPending -> {
+                        // M-PESA is processing — log as INFO (no amount counted yet, SMS will confirm)
+                        logsManager.addLog(LogStatus.INFO, "Confirming Transfer", dialogText, null, contactId)
+                        TransactionEventBus.emit(TransactionResult(
+                            success = true,
+                            message = "your request is being processed. please wait for the confirmation short message. ok",
+                            amount = amountDouble,
+                            contactName = contactName ?: phoneNumber
+                        ))
+                        if (buttonNode != null) clickNode(buttonNode!!)
+                        endSession(this@MpesaUssdService)
+                    }
+                    else -> {
+                        logsManager.addLog(LogStatus.SUCCESS, "Transaction Completed", dialogText, amountDouble, contactId)
+                        TransactionEventBus.emit(TransactionResult(
+                            success = true,
+                            message = "Transaction submitted. Please check SMS for confirmation.",
+                            amount = amountDouble,
+                            contactName = contactName ?: phoneNumber
+                        ))
+                        if (buttonNode != null) clickNode(buttonNode!!)
+                        endSession(this@MpesaUssdService)
+                    }
+                }
                 actionTaken = true
             } else if (dialogText.replace(" ", "").contains("call*334#") || dialogText.contains("select sim") || dialogText.contains("choose sim") || (dialogText.contains("call") && dialogText.contains("safaricom"))) {
                 val clicked = clickFirstSimOption(rootNode)
