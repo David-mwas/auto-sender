@@ -4,12 +4,29 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Outer circle -->
+
+    <!-- Shield body -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,54 m-42,0 a42,42 0 1,0 84,0 a42,42 0 1,0 -84,0" />
-    <!-- Letter M -->
+        android:pathData="M54,14
+            C54,14 22,26 22,46
+            L22,68
+            C22,82 37,92 54,96
+            C71,92 86,82 86,68
+            L86,46
+            C86,26 54,14 54,14 Z" />
+
+    <!-- Send / arrow icon inside shield (pointing up-right) -->
     <path
-        android:fillColor="#2E7D32"
-        android:pathData="M28,72 L28,36 L40,36 L54,58 L68,36 L80,36 L80,72 L70,72 L70,52 L57,72 L51,72 L38,52 L38,72 Z" />
+        android:fillColor="#145A32"
+        android:pathData="M38,68 L50,40 L78,52 L60,58 L54,72 Z" />
+    <path
+        android:fillColor="#27AE60"
+        android:pathData="M50,40 L60,58 L54,72 L50,40 Z" />
+
+    <!-- Small accent dot top-right of shield -->
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M75,30 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+
 </vector>

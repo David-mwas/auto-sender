@@ -108,10 +108,30 @@ class MainActivity : FragmentActivity() {
                 var isAuthenticated by remember { mutableStateOf(false) }
                 var showPermissionDialog by remember { mutableStateOf(false) }
 
+                // Auto-lock: poll every 30s; re-lock if idle timeout exceeded
+                LaunchedEffect(isAuthenticated) {
+                    if (isAuthenticated) {
+                        while (true) {
+                            delay(30_000)
+                            if (LockManager.isLocked(this@MainActivity)) {
+                                isAuthenticated = false
+                            }
+                        }
+                    }
+                }
+
                 if (!isAuthenticated) {
                     AppLockScreen(
-                        onUnlock = { isAuthenticated = true },
-                        onBiometricUnlock = { authenticateForAccess { isAuthenticated = true } }
+                        onUnlock = {
+                            LockManager.resetTimer()
+                            isAuthenticated = true
+                        },
+                        onBiometricUnlock = {
+                            authenticateForAccess {
+                                LockManager.resetTimer()
+                                isAuthenticated = true
+                            }
+                        }
                     )
                 } else {
                     Box(modifier = Modifier.fillMaxSize()) {
@@ -120,6 +140,7 @@ class MainActivity : FragmentActivity() {
                             logsManager = logsManager,
                             themeManager = themeManager,
                             onSendMoney = { contact, amount ->
+                                LockManager.recordActivity()
                                 if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED || ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
                                     showPermissionDialog = true
                                 } else {
@@ -128,6 +149,10 @@ class MainActivity : FragmentActivity() {
                             },
                             onOpenSettings = {
                                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            },
+                            onLock = {
+                                LockManager.resetTimer()
+                                isAuthenticated = false
                             }
                         )
 
@@ -278,46 +303,108 @@ class MainActivity : FragmentActivity() {
 @Composable
 fun AppLockScreen(onUnlock: () -> Unit, onBiometricUnlock: () -> Unit) {
     val context = LocalContext.current
-    var manualPin by remember { mutableStateOf("") }
     val savedPin = SecurityHelper.getPin(context)
-    val isDark = isSystemInDarkTheme()
-    val gradientColors = if (isDark) {
-        listOf(Color(0xFF0D1F0D), Color(0xFF1B3A1B), Color(0xFF0D1F0D))
-    } else {
-        listOf(Color(0xFF2E7D32), Color(0xFF43A047), Color(0xFF1B5E20))
+    var manualPin by remember { mutableStateOf("") }
+    
+    // Shake animation for error
+    val shakeOffset = remember { Animatable(0f) }
+    val coroutineScope = rememberCoroutineScope()
+    
+    fun triggerErrorShake() {
+        coroutineScope.launch {
+            shakeOffset.animateTo(15f, animationSpec = tween(50, easing = LinearEasing))
+            shakeOffset.animateTo(-15f, animationSpec = tween(50, easing = LinearEasing))
+            shakeOffset.animateTo(15f, animationSpec = tween(50, easing = LinearEasing))
+            shakeOffset.animateTo(-15f, animationSpec = tween(50, easing = LinearEasing))
+            shakeOffset.animateTo(0f, animationSpec = tween(50, easing = LinearEasing))
+            manualPin = ""
+            // Haptic feedback (simple workaround)
+            android.view.HapticFeedbackConstants.LONG_PRESS.let { 
+                (context as? android.app.Activity)?.window?.decorView?.performHapticFeedback(it) 
+            }
+        }
     }
+
+    val isDark = isSystemInDarkTheme()
+    val headerGradient = if (isDark)
+        Brush.linearGradient(
+            colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+            start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+        )
+    else
+        Brush.linearGradient(
+            colors = listOf(GradientStart, GradientMid, GradientEnd),
+            start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+        )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Brush.verticalGradient(gradientColors)),
+            .background(headerGradient)
+            .statusBarsPadding(),
         contentAlignment = Alignment.Center
     ) {
+        // Background decorative circles
+        Box(modifier = Modifier.size(240.dp).offset(x = 120.dp, y = (-120).dp).align(Alignment.TopEnd).clip(CircleShape).background(Color.White.copy(alpha = 0.03f)))
+        Box(modifier = Modifier.size(160.dp).offset(x = (-60).dp, y = 80.dp).align(Alignment.BottomStart).clip(CircleShape).background(Color.White.copy(alpha = 0.03f)))
+
         Column(
             modifier = Modifier.fillMaxWidth().padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // Pulse animation for logo
+            val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+            val pulseScale by infiniteTransition.animateFloat(
+                initialValue = 0.95f,
+                targetValue = 1.05f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(1500, easing = EaseInOutSine),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "pulse_scale"
+            )
+            val glowAlpha by infiniteTransition.animateFloat(
+                initialValue = 0.05f,
+                targetValue = 0.15f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(1500, easing = EaseInOutSine),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "glow_alpha"
+            )
+
             // Logo area
-            Box(
-                modifier = Modifier
-                    .size(100.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("M", fontSize = 52.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Box(contentAlignment = Alignment.Center) {
+                // Glow ring
+                Box(
+                    modifier = Modifier
+                        .size(110.dp)
+                        .scale(pulseScale)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = glowAlpha))
+                )
+                // Logo bg
+                Box(
+                    modifier = Modifier
+                        .size(80.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Lock, null, tint = Color.White, modifier = Modifier.size(36.dp))
+                }
             }
             Spacer(modifier = Modifier.height(24.dp))
-            Text("AutoSender", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.Bold)
-            Text("Secure M-PESA Automation", style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.8f))
+            Text("AutoSender", style = MaterialTheme.typography.headlineLarge, color = Color.White, fontWeight = FontWeight.ExtraBold)
+            Text("Secure M-PESA Automation", style = MaterialTheme.typography.bodyMedium, color = MpesaAccentGreen, fontWeight = FontWeight.SemiBold, letterSpacing = 0.5.sp)
             Spacer(modifier = Modifier.height(48.dp))
 
             // Biometric button
             Button(
                 onClick = onBiometricUnlock,
-                modifier = Modifier.fillMaxWidth().height(56.dp),
+                modifier = Modifier.fillMaxWidth(0.85f).height(56.dp),
                 shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.2f), contentColor = Color.White)
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.15f), contentColor = Color.White)
             ) {
                 Icon(Icons.Default.Fingerprint, contentDescription = null, modifier = Modifier.size(24.dp))
                 Spacer(modifier = Modifier.width(12.dp))
@@ -325,42 +412,95 @@ fun AppLockScreen(onUnlock: () -> Unit, onBiometricUnlock: () -> Unit) {
             }
 
             if (!savedPin.isNullOrEmpty()) {
-                Spacer(modifier = Modifier.height(24.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.3f))
-                    Text("  or use PIN  ", color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
-                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.3f))
-                }
-                Spacer(modifier = Modifier.height(24.dp))
-                OutlinedTextField(
-                    value = manualPin,
-                    onValueChange = { manualPin = it },
-                    label = { Text("M-PESA PIN", color = Color.White.copy(alpha = 0.8f)) },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White.copy(alpha = 0.9f),
-                        focusedBorderColor = Color.White,
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.5f),
-                        cursorColor = Color.White,
-                        focusedContainerColor = Color.Transparent,
-                        unfocusedContainerColor = Color.Transparent
-                    )
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = {
-                        if (manualPin == savedPin) onUnlock()
-                        else Toast.makeText(context, "Incorrect PIN", Toast.LENGTH_SHORT).show()
-                    },
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.2f), contentColor = Color.White)
+                Spacer(modifier = Modifier.height(32.dp))
+                
+                // PIN dots display
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    modifier = Modifier.offset(x = shakeOffset.value.dp)
                 ) {
-                    Text("Unlock with PIN", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    // Assuming 4-digit PIN for the visual dots, but savedPin length might vary.
+                    // Let's just show up to the savedPin length dots.
+                    val pinLength = savedPin.length
+                    for (i in 0 until pinLength) {
+                        val isFilled = i < manualPin.length
+                        val dotColor = if (isFilled) Color.White else Color.White.copy(alpha = 0.2f)
+                        val dotSize = if (isFilled) 14.dp else 12.dp
+                        Box(
+                            modifier = Modifier
+                                .size(16.dp) // Fixed container
+                                .align(Alignment.CenterVertically)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(dotSize)
+                                    .clip(CircleShape)
+                                    .background(dotColor)
+                                    .align(Alignment.Center)
+                            )
+                        }
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(32.dp))
+                
+                // Custom numeric keypad
+                Column(
+                    modifier = Modifier.fillMaxWidth(0.85f),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    val keyRows = listOf(
+                        listOf("1", "2", "3"),
+                        listOf("4", "5", "6"),
+                        listOf("7", "8", "9"),
+                        listOf("", "0", "⌫")
+                    )
+                    
+                    for (row in keyRows) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            for (key in row) {
+                                if (key.isEmpty()) {
+                                    Spacer(modifier = Modifier.size(72.dp))
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(72.dp)
+                                            .clip(CircleShape)
+                                            .background(Color.White.copy(alpha = if (key == "⌫") 0.05f else 0.1f))
+                                            .clickable {
+                                                if (key == "⌫") {
+                                                    if (manualPin.isNotEmpty()) {
+                                                        manualPin = manualPin.dropLast(1)
+                                                    }
+                                                } else {
+                                                    if (manualPin.length < savedPin.length) {
+                                                        manualPin += key
+                                                    }
+                                                    if (manualPin.length == savedPin.length) {
+                                                        if (manualPin == savedPin) {
+                                                            onUnlock()
+                                                        } else {
+                                                            triggerErrorShake()
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = key,
+                                            fontSize = 28.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -377,7 +517,8 @@ fun AutoSenderApp(
     logsManager: LogsManager,
     themeManager: ThemeManager,
     onSendMoney: (Contact, String) -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onLock: () -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var contacts by remember { mutableStateOf(contactsManager.getContacts()) }
@@ -448,7 +589,7 @@ fun AutoSenderApp(
                     onSendMoney = onSendMoney
                 )
                 1 -> LogsTab(logsManager = logsManager, refreshTrigger = refreshTrigger)
-                2 -> SettingsTab(themeManager = themeManager, onOpenSettings = onOpenSettings)
+                2 -> SettingsTab(themeManager = themeManager, onOpenSettings = onOpenSettings, onLock = onLock)
             }
         }
     }
@@ -504,6 +645,12 @@ fun HomeTab(
     var searchQuery by remember { mutableStateOf("") }
     var visibleItemCount by remember { mutableStateOf(20) }
     val listState = rememberLazyListState()
+    
+    var isInitialLoad by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        delay(800)
+        isInitialLoad = false
+    }
     
     val filteredContacts = remember(contacts, searchQuery) {
         if (searchQuery.isEmpty()) contacts
@@ -585,26 +732,32 @@ fun HomeTab(
                 )
                 Spacer(modifier = Modifier.height(12.dp))
             }
-            items(filteredContacts.take(visibleItemCount)) { contact ->
-                ContactCard(
-                    contact = contact,
-                    logsManager = logsManager,
-                    refreshTrigger = refreshTrigger,
-                    onClick = { selectedContact = contact },
-                    onEdit = { editContact = contact },
-                    onDelete = {
-                        contactsManager.removeContact(contact.id)
-                        onContactsChanged()
-                    }
-                )
-            }
-            if (contacts.isEmpty()) {
-                item {
-                    EmptyState(
-                        icon = Icons.Default.People,
-                        title = "No Contacts Yet",
-                        subtitle = "Tap the + button to add your first recipient"
+            if (isInitialLoad && contacts.isEmpty()) {
+                items(5) {
+                    ShimmerContactCard()
+                }
+            } else {
+                items(filteredContacts.take(visibleItemCount)) { contact ->
+                    ContactCard(
+                        contact = contact,
+                        logsManager = logsManager,
+                        refreshTrigger = refreshTrigger,
+                        onClick = { selectedContact = contact },
+                        onEdit = { editContact = contact },
+                        onDelete = {
+                            contactsManager.removeContact(contact.id)
+                            onContactsChanged()
+                        }
                     )
+                }
+                if (contacts.isEmpty()) {
+                    item {
+                        EmptyState(
+                            icon = Icons.Default.People,
+                            title = "No Contacts Yet",
+                            subtitle = "Tap the + button to add your first recipient"
+                        )
+                    }
                 }
             }
         }
@@ -709,6 +862,8 @@ fun ContactCard(
         label = "card_elevation"
     )
 
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
     // Avatar gradient - each contact gets a deterministic color based on initials
     val avatarHue = (initials.hashCode().and(0xFF) / 255f) * 120f + 90f // greens 90-210
     val avatarColor1 = Color.hsv(avatarHue, 0.65f, 0.7f)
@@ -771,23 +926,40 @@ fun ContactCard(
             IconButton(
                 onClick = onEdit,
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(12.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant)
             ) {
-                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
             }
-            Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(8.dp))
             IconButton(
-                onClick = onDelete,
+                onClick = { showDeleteConfirm = true },
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(12.dp))
                     .background(ErrorRed.copy(alpha = 0.10f))
             ) {
-                Icon(Icons.Default.Delete, null, tint = ErrorRed, modifier = Modifier.size(16.dp))
+                Icon(Icons.Default.Delete, null, tint = ErrorRed, modifier = Modifier.size(20.dp))
             }
         }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete Contact", fontWeight = FontWeight.Bold) },
+            text = { Text("Are you sure you want to delete ${contact.name}? This will not delete their transaction logs.") },
+            confirmButton = {
+                Button(
+                    onClick = { showDeleteConfirm = false; onDelete() },
+                    colors = ButtonDefaults.buttonColors(containerColor = ErrorRed)
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -1031,6 +1203,12 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
         }
     )
     
+    var isInitialLoad by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        delay(800)
+        isInitialLoad = false
+    }
+    
     val filteredLogs = remember(allLogs, searchQuery, filterStatus) {
         allLogs.filter { log ->
             val matchesSearch = searchQuery.isBlank() || log.message.contains(searchQuery, true) || log.contextDetails.contains(searchQuery, true)
@@ -1088,12 +1266,12 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
                     Text("Transaction Logs", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
                     Text("${filteredLogs.size} of ${allLogs.size} records", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.75f))
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     // Export button
                     IconButton(
                         onClick = { showExportDialog = true },
                         modifier = Modifier
-                            .size(42.dp)
+                            .size(44.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(Color.White.copy(alpha = 0.15f))
                     ) {
@@ -1108,7 +1286,7 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
                     IconButton(
                         onClick = { showClearConfirm = true },
                         modifier = Modifier
-                            .size(42.dp)
+                            .size(44.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(Color(0xFFB71C1C).copy(alpha = 0.3f))
                     ) {
@@ -1148,11 +1326,17 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
             }
             Spacer(modifier = Modifier.height(12.dp))
             LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(filteredLogs.take(visibleItemCount)) { log -> 
-                    LogItemCard(log, onClick = { selectedLog = log }) 
-                }
-                if (filteredLogs.isEmpty()) {
-                    item { EmptyState(Icons.Default.SearchOff, "No Results", "Try adjusting your search or filters") }
+                if (isInitialLoad && allLogs.isEmpty()) {
+                    items(6) {
+                        ShimmerLogCard()
+                    }
+                } else {
+                    items(filteredLogs.take(visibleItemCount)) { log -> 
+                        LogItemCard(log, onClick = { selectedLog = log }) 
+                    }
+                    if (filteredLogs.isEmpty()) {
+                        item { EmptyState(Icons.Default.SearchOff, "No Results", "Try adjusting your search or filters") }
+                    }
                 }
                 item { Spacer(modifier = Modifier.height(16.dp)) }
             }
@@ -1525,11 +1709,12 @@ fun DetailRow(label: String, value: String) {
 //  SETTINGS TAB
 // ─────────────────────────────────────────────
 @Composable
-fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit) {
+fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit, onLock: () -> Unit) {
     val context = LocalContext.current
     var showPinDialog by remember { mutableStateOf(false) }
     var pin by remember { mutableStateOf(SecurityHelper.getPin(context) ?: "") }
     val currentTheme by themeManager.themeMode.collectAsState()
+    var currentTimeoutMs by remember { mutableLongStateOf(LockManager.getTimeoutMs(context)) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         val isDark = isSystemInDarkTheme()
@@ -1620,6 +1805,35 @@ fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit) {
                             Text("Update your encrypted PIN", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Auto-lock Timeout", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LockManager.TIMEOUT_OPTIONS.forEach { (label, ms) ->
+                                ThemeChip(label, currentTimeoutMs == ms, Icons.Default.Timer) {
+                                    currentTimeoutMs = ms
+                                    LockManager.saveTimeoutMs(context, ms)
+                                    LockManager.resetTimer()
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = onLock,
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primaryContainer, contentColor = MaterialTheme.colorScheme.onPrimaryContainer),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Lock, null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Lock Screen Now", fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
@@ -2143,6 +2357,89 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                     }
                 }
             }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  SHIMMER LOADING COMPONENTS
+// ─────────────────────────────────────────────
+@Composable
+fun ShimmerBox(modifier: Modifier = Modifier, cornerRadius: androidx.compose.ui.unit.Dp = 8.dp) {
+    val isDark = isSystemInDarkTheme()
+    val baseColor = if (isDark) Color(0xFF2A2A2A) else Color(0xFFE0E0E0)
+    val highlightColor = if (isDark) Color(0xFF3A3A3A) else Color(0xFFF5F5F5)
+
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val translateAnim by transition.animateFloat(
+        initialValue = -500f,
+        targetValue = 1500f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmer_translation"
+    )
+
+    val brush = Brush.linearGradient(
+        colors = listOf(baseColor, highlightColor, baseColor),
+        start = Offset(x = translateAnim - 200f, y = translateAnim - 200f),
+        end = Offset(x = translateAnim, y = translateAnim)
+    )
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(brush)
+    )
+}
+
+@Composable
+fun ShimmerContactCard() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(18.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ShimmerBox(modifier = Modifier.size(54.dp), cornerRadius = 27.dp) // Avatar
+            Spacer(modifier = Modifier.width(14.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                ShimmerBox(modifier = Modifier.fillMaxWidth(0.6f).height(18.dp)) // Name
+                Spacer(modifier = Modifier.height(6.dp))
+                ShimmerBox(modifier = Modifier.fillMaxWidth(0.4f).height(14.dp)) // Phone
+            }
+            Spacer(modifier = Modifier.width(14.dp))
+            ShimmerBox(modifier = Modifier.size(44.dp), cornerRadius = 12.dp) // Edit button
+            Spacer(modifier = Modifier.width(8.dp))
+            ShimmerBox(modifier = Modifier.size(44.dp), cornerRadius = 12.dp) // Delete button
+        }
+    }
+}
+
+@Composable
+fun ShimmerLogCard() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ShimmerBox(modifier = Modifier.size(42.dp), cornerRadius = 12.dp) // Icon
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                ShimmerBox(modifier = Modifier.fillMaxWidth(0.7f).height(16.dp)) // Title
+                Spacer(modifier = Modifier.height(6.dp))
+                ShimmerBox(modifier = Modifier.fillMaxWidth(0.3f).height(12.dp)) // Date
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            ShimmerBox(modifier = Modifier.width(60.dp).height(24.dp), cornerRadius = 12.dp) // Status pill
         }
     }
 }
