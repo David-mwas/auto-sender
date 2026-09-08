@@ -82,10 +82,6 @@ class MpesaUssdService : AccessibilityService() {
                 return@launch 
             }
             
-            // Record errors if the USSD throws an explicit error message
-            if (dialogText.contains("error") || dialogText.contains("m-pesa cannot") || dialogText.contains("invalid")) {
-                logsManager.addLog(LogStatus.ERROR, "USSD Error", dialogText)
-            }
 
             delay(400)
             var actionTaken = true
@@ -104,7 +100,6 @@ class MpesaUssdService : AccessibilityService() {
                 when {
                     dialogText.contains("send money") && dialogText.contains("withdraw") -> {
                         Toast.makeText(applicationContext, "Selecting: Send Money", Toast.LENGTH_SHORT).show()
-                        logsManager.addLog(LogStatus.INFO, "Started Sending Money", "Navigating Send Money Menu")
                         inputText(inputNode!!, "1")
                         delay(800)
                         clickNode(buttonNode!!)
@@ -149,7 +144,6 @@ class MpesaUssdService : AccessibilityService() {
                     dialogText.contains("send") && dialogText.contains("ksh") && (dialogText.contains("accept") || dialogText.contains("reply with 1")) -> {
                         val opt = if (dialogText.contains("accept")) (getOption(dialogText, "accept") ?: "1") else "1"
                         Toast.makeText(applicationContext, "Confirming Transfer", Toast.LENGTH_SHORT).show()
-                        logsManager.addLog(LogStatus.INFO, "Confirming Transfer", "Auto-accepting confirmation dialog: $dialogText")
                         inputText(inputNode!!, opt)
                         delay(800)
                         clickNode(buttonNode!!)
