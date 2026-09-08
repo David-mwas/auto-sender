@@ -81,7 +81,7 @@ class MpesaUssdService : AccessibilityService() {
                 return@launch
             }
             
-            if (android.BuildConfig.DEBUG) Log.d(TAG, "USSD Dialog text: $dialogText")
+            if (com.dmwas.autosendapp.BuildConfig.DEBUG) Log.d(TAG, "USSD Dialog text: $dialogText")
 
             if (dialogText == lastDialogText) {
                 return@launch 
@@ -99,7 +99,7 @@ class MpesaUssdService : AccessibilityService() {
             val contactName = txPrefs.getString("contact_name", null)
 
             // PIN is read directly from encrypted storage — never stored in plain TxPrefs
-            val pin = SecurityHelper.getPin(this) ?: ""
+            val pin = SecurityHelper.getPin(this@MpesaUssdService) ?: ""
 
             if (inputNode != null && buttonNode != null) {
                 when {
