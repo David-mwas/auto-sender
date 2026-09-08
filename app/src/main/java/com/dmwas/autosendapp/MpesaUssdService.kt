@@ -54,6 +54,13 @@ class MpesaUssdService : AccessibilityService() {
         serviceScope.launch {
             delay(400) // Give the normal USSD dialog time to fully render on screen
 
+            // Re-check session is still active after the delay.
+            // Multiple accessibility events can fire in rapid succession (all passing the
+            // pre-launch check above). Once the first coroutine finishes and calls endSession(),
+            // this guard ensures every other pending coroutine exits immediately instead of
+            // logging the same transaction again.
+            if (!getSharedPreferences("UssdPrefs", Context.MODE_PRIVATE).getBoolean("isSessionActive", false)) return@launch
+
             val rootNode = rootInActiveWindow ?: event?.source ?: return@launch
             var inputNode: AccessibilityNodeInfo? = null
             var buttonNode: AccessibilityNodeInfo? = null
