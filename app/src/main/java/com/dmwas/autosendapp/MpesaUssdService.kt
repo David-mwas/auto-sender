@@ -204,11 +204,11 @@ class MpesaUssdService : AccessibilityService() {
                         endSession(this@MpesaUssdService)
                     }
                     isPending -> {
-                        // M-PESA is processing — log as INFO (no amount counted yet, SMS will confirm)
-                        logsManager.addLog(LogStatus.INFO, "Confirming Transfer", dialogText, null, contactId)
+                        // M-PESA is processing the transfer — money has been sent, SMS will confirm
+                        logsManager.addLog(LogStatus.SUCCESS, "Transfer Submitted", dialogText, amountDouble, contactId)
                         TransactionEventBus.emit(TransactionResult(
                             success = true,
-                            message = "your request is being processed. please wait for the confirmation short message. ok",
+                            message = "Transfer submitted! Your request is being processed. Please wait for the confirmation SMS.",
                             amount = amountDouble,
                             contactName = contactName ?: phoneNumber
                         ))
