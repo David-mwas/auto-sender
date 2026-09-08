@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.room.Entity
 import androidx.room.PrimaryKey
-import androidx.room.Room
 import com.dmwas.autosendapp.db.AutoSenderDatabase
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import java.util.Date
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.Calendar
 
 enum class LogStatus {
@@ -27,14 +29,13 @@ data class TransactionLog(
 )
 
 class LogsManager(context: Context) {
-    private val db = Room.databaseBuilder(
-        context.applicationContext,
-        AutoSenderDatabase::class.java, "autosender-db"
-    ).allowMainThreadQueries().build()
-
+    // Shared singleton connection — no extra DB handles opened
+    private val db = AutoSenderDatabase.getInstance(context)
     private val transactionLogDao = db.transactionLogDao()
     private val prefs: SharedPreferences = context.getSharedPreferences("LogsPrefs", Context.MODE_PRIVATE)
     private val gson = Gson()
+    // All writes (insert / delete / migrate) run on IO — never blocks the UI thread
+    private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     init {
         migrateFromSharedPreferences()
@@ -43,17 +44,18 @@ class LogsManager(context: Context) {
     private fun migrateFromSharedPreferences() {
         val json = prefs.getString("logs_list", null)
         if (!json.isNullOrEmpty()) {
-            try {
-                val type = object : TypeToken<List<TransactionLog>>() {}.type
-                val oldLogs: List<TransactionLog> = gson.fromJson(json, type) ?: emptyList()
-                if (oldLogs.isNotEmpty()) {
-                    transactionLogDao.insertLogs(oldLogs)
+            ioScope.launch {
+                try {
+                    val type = object : TypeToken<List<TransactionLog>>() {}.type
+                    val oldLogs: List<TransactionLog> = gson.fromJson(json, type) ?: emptyList()
+                    if (oldLogs.isNotEmpty()) {
+                        transactionLogDao.insertLogs(oldLogs)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
+                prefs.edit().remove("logs_list").apply()
             }
-            // Clear SharedPreferences after successful migration
-            prefs.edit().remove("logs_list").apply()
         }
     }
 
@@ -71,11 +73,11 @@ class LogsManager(context: Context) {
             amount = amount,
             contactId = contactId
         )
-        transactionLogDao.insertLog(log)
+        ioScope.launch { transactionLogDao.insertLog(log) }
     }
 
     fun clearLogs() {
-        transactionLogDao.deleteAllLogs()
+        ioScope.launch { transactionLogDao.deleteAllLogs() }
     }
     
     fun getTotalSentAllTime(contactId: String? = null): Double {

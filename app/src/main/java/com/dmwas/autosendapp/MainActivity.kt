@@ -265,7 +265,7 @@ class MainActivity : FragmentActivity() {
             .putString("contact_id", contact.id)
             .putString("contact_name", contact.name)
             .putString("amount", amount)
-            .putString("mpesa_pin", pin)
+            // PIN is NOT stored here — service reads it directly from EncryptedSharedPreferences
             .apply()
         MpesaUssdService.startSession(this, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main))
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {

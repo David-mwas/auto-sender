@@ -21,9 +21,13 @@ class MpesaUssdService : AccessibilityService() {
     private val logsManager by lazy { LogsManager(this) }
 
     companion object {
+        // Held so startSession() can reset lastDialogText for the new send session
+        @Volatile private var instance: MpesaUssdService? = null
         private var sessionTimeoutJob: kotlinx.coroutines.Job? = null
 
         fun startSession(context: Context, scope: CoroutineScope) {
+            // Reset dedup guard so a new session with identical dialog text is not skipped
+            instance?.lastDialogText = ""
             context.getSharedPreferences("UssdPrefs", Context.MODE_PRIVATE).edit().putBoolean("isSessionActive", true).apply()
             sessionTimeoutJob?.cancel()
             sessionTimeoutJob = scope.launch {
@@ -41,6 +45,7 @@ class MpesaUssdService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        instance = this
         Log.d(TAG, "Service connected — dormant until USSD session starts")
     }
 
@@ -76,7 +81,7 @@ class MpesaUssdService : AccessibilityService() {
                 return@launch
             }
             
-            Log.d(TAG, "USSD Dialog text: $dialogText")
+            if (android.BuildConfig.DEBUG) Log.d(TAG, "USSD Dialog text: $dialogText")
 
             if (dialogText == lastDialogText) {
                 return@launch 
@@ -92,9 +97,9 @@ class MpesaUssdService : AccessibilityService() {
             val amountDouble = amount.toDoubleOrNull()
             val contactId = txPrefs.getString("contact_id", null)
             val contactName = txPrefs.getString("contact_name", null)
-            
-            val securePrefs = getSharedPreferences("SecurePrefs", Context.MODE_PRIVATE)
-            val pin = txPrefs.getString("mpesa_pin", "") ?: ""
+
+            // PIN is read directly from encrypted storage — never stored in plain TxPrefs
+            val pin = SecurityHelper.getPin(this) ?: ""
 
             if (inputNode != null && buttonNode != null) {
                 when {
@@ -415,6 +420,7 @@ class MpesaUssdService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        instance = null
         endSession(this)
         serviceScope.cancel()
     }
