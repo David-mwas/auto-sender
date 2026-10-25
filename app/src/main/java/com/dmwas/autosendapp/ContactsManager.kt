@@ -10,6 +10,7 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 
 @Entity(tableName = "contacts")
@@ -24,6 +25,8 @@ class ContactsManager(context: Context) {
     // All writes run on IO — never blocks the UI thread
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    val contactsFlow: Flow<List<Contact>> = contactDao.getAllContactsFlow()
+
     init {
         migrateFromSharedPreferences()
     }
@@ -36,7 +39,11 @@ class ContactsManager(context: Context) {
                     val type = object : TypeToken<List<Contact>>() {}.type
                     val oldContacts: List<Contact> = gson.fromJson(json, type) ?: emptyList()
                     if (oldContacts.isNotEmpty()) {
-                        contactDao.insertContacts(oldContacts)
+                        contactDao.insertContacts(
+                            oldContacts.map {
+                                it.copy(phoneNumber = ContactPickerHelper.normalizePhoneNumber(it.phoneNumber))
+                            }
+                        )
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -50,12 +57,28 @@ class ContactsManager(context: Context) {
         return contactDao.getAllContacts()
     }
 
+    fun findByPhoneNumber(phone: String): Contact? {
+        val normalized = ContactPickerHelper.normalizePhoneNumber(phone)
+        if (normalized.isEmpty()) return null
+        return getContacts().firstOrNull {
+            ContactPickerHelper.normalizePhoneNumber(it.phoneNumber) == normalized
+        }
+    }
+
     fun addContact(contact: Contact) {
-        ioScope.launch { contactDao.insertContact(contact) }
+        val normalizedContact = contact.copy(
+            name = contact.name.trim(),
+            phoneNumber = ContactPickerHelper.normalizePhoneNumber(contact.phoneNumber)
+        )
+        ioScope.launch { contactDao.insertContact(normalizedContact) }
     }
 
     fun updateContact(contact: Contact) {
-        ioScope.launch { contactDao.updateContact(contact) }
+        val normalizedContact = contact.copy(
+            name = contact.name.trim(),
+            phoneNumber = ContactPickerHelper.normalizePhoneNumber(contact.phoneNumber)
+        )
+        ioScope.launch { contactDao.updateContact(normalizedContact) }
     }
 
     fun removeContact(contactId: String) {

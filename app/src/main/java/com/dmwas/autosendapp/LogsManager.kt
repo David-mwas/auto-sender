@@ -10,7 +10,9 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Calendar
 
 enum class LogStatus {
@@ -36,6 +38,8 @@ class LogsManager(context: Context) {
     private val gson = Gson()
     // All writes (insert / delete / migrate) run on IO — never blocks the UI thread
     private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    val logsFlow: Flow<List<TransactionLog>> = transactionLogDao.getAllLogsFlow()
 
     init {
         migrateFromSharedPreferences()
@@ -76,31 +80,81 @@ class LogsManager(context: Context) {
         ioScope.launch { transactionLogDao.insertLog(log) }
     }
 
+    /**
+     * Inserts a log entry on Dispatchers.IO and suspends until the DB write is committed.
+     * Ensures UI collectors and queries immediately see the new transaction when notified.
+     */
+    suspend fun addLogAndWait(
+        status: LogStatus,
+        message: String,
+        contextDetails: String,
+        amount: Double? = null,
+        contactId: String? = null
+    ): TransactionLog {
+        val log = TransactionLog(
+            id = java.util.UUID.randomUUID().toString(),
+            timestamp = System.currentTimeMillis(),
+            status = status,
+            message = message,
+            contextDetails = contextDetails,
+            amount = amount,
+            contactId = contactId
+        )
+        withContext(Dispatchers.IO) {
+            transactionLogDao.insertLog(log)
+        }
+        return log
+    }
+
+    fun updateLogStatus(id: String, status: LogStatus, message: String, amount: Double?) {
+        ioScope.launch {
+            transactionLogDao.updateLogStatus(id, status, message, amount)
+        }
+    }
+
+    fun deleteLog(id: String) {
+        ioScope.launch {
+            transactionLogDao.deleteLog(id)
+        }
+    }
+
     fun clearLogs() {
         ioScope.launch { transactionLogDao.deleteAllLogs() }
     }
     
     fun getTotalSentAllTime(contactId: String? = null): Double {
-        val logs = getLogs()
-        return logs.filter { it.status == LogStatus.SUCCESS && it.amount != null && (contactId == null || it.contactId == contactId) }
-            .sumOf { it.amount!! }
+        return calculateTotalSentAllTime(getLogs(), contactId)
     }
     
     fun getTotalSentToday(contactId: String? = null): Double {
-        val logs = getLogs()
-        val todayStart = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
-        
-        return logs.filter { 
-            it.status == LogStatus.SUCCESS && 
-            it.amount != null && 
-            it.timestamp >= todayStart &&
-            (contactId == null || it.contactId == contactId)
-        }.sumOf { it.amount!! }
+        return calculateTotalSentToday(getLogs(), contactId)
+    }
+
+    companion object {
+        fun calculateTotalSentAllTime(logs: List<TransactionLog>, contactId: String? = null): Double {
+            return logs.asSequence()
+                .filter { it.status == LogStatus.SUCCESS && it.amount != null && it.amount > 0.0 && (contactId == null || it.contactId == contactId) }
+                .sumOf { it.amount!! }
+        }
+
+        fun calculateTotalSentToday(logs: List<TransactionLog>, contactId: String? = null): Double {
+            val todayStart = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+
+            return logs.asSequence()
+                .filter {
+                    it.status == LogStatus.SUCCESS &&
+                    it.amount != null &&
+                    it.amount > 0.0 &&
+                    it.timestamp >= todayStart &&
+                    (contactId == null || it.contactId == contactId)
+                }
+                .sumOf { it.amount!! }
+        }
     }
 
     /**

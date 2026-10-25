@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.biometric.BiometricManager
@@ -36,6 +37,9 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.filled.Nfc
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.ReceiptLong
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.TextSnippet
 import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.pullrefresh.PullRefreshIndicator
 import androidx.compose.material.pullrefresh.pullRefresh
@@ -46,6 +50,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
@@ -245,6 +252,18 @@ class MainActivity : FragmentActivity() {
             Toast.makeText(this, "Please set your M-PESA PIN in Settings first", Toast.LENGTH_LONG).show()
             return
         }
+        val normalizedPhone = ContactPickerHelper.normalizePhoneNumber(contact.phoneNumber)
+        if (normalizedPhone.isEmpty()) {
+            Toast.makeText(this, "Please enter a valid recipient phone number", Toast.LENGTH_LONG).show()
+            return
+        }
+        val parsedAmount = ContactPickerHelper.parseAmount(amount)
+        if (parsedAmount == null) {
+            Toast.makeText(this, "Please enter a valid amount greater than 0", Toast.LENGTH_LONG).show()
+            return
+        }
+        val cleanUssdAmount = ContactPickerHelper.sanitizeAmountForUssd(amount)
+
         if (!isAccessibilityServiceEnabled()) {
             Toast.makeText(this, "Please enable AutoSender in Accessibility Settings", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -261,13 +280,13 @@ class MainActivity : FragmentActivity() {
         }
         val txPrefs = getSharedPreferences("TxPrefs", Context.MODE_PRIVATE)
         txPrefs.edit()
-            .putString("phone_number", contact.phoneNumber)
+            .putString("phone_number", normalizedPhone)
             .putString("contact_id", contact.id)
             .putString("contact_name", contact.name)
-            .putString("amount", amount)
+            .putString("amount", cleanUssdAmount)
             // PIN is NOT stored here — service reads it directly from EncryptedSharedPreferences
             .apply()
-        MpesaUssdService.startSession(this, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main))
+        MpesaUssdService.startSession(this)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
             val intent = Intent(Intent.ACTION_CALL)
             intent.data = Uri.parse("tel:*334%23")
@@ -325,7 +344,7 @@ fun AppLockScreen(onUnlock: () -> Unit, onBiometricUnlock: () -> Unit) {
         }
     }
 
-    val isDark = isSystemInDarkTheme()
+    val isDark = LocalIsDarkTheme.current
     val headerGradient = if (isDark)
         Brush.linearGradient(
             colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
@@ -502,6 +521,15 @@ fun AppLockScreen(onUnlock: () -> Unit, onBiometricUnlock: () -> Unit) {
                         }
                     }
                 }
+            } else {
+                Spacer(modifier = Modifier.height(16.dp))
+                TextButton(onClick = onUnlock) {
+                    Text(
+                        "First time? Continue to set up M-PESA PIN →",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
             }
         }
     }
@@ -521,7 +549,8 @@ fun AutoSenderApp(
     onLock: () -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
-    var contacts by remember { mutableStateOf(contactsManager.getContacts()) }
+    val contacts by contactsManager.contactsFlow.collectAsState(initial = remember { contactsManager.getContacts() })
+    val allLogs by logsManager.logsFlow.collectAsState(initial = remember { logsManager.getLogs() })
     var showAddContactDialog by remember { mutableStateOf(false) }
     var transactionModal by remember { mutableStateOf<TransactionResult?>(null) }
     var refreshTrigger by remember { mutableStateOf(0) }
@@ -535,6 +564,10 @@ fun AutoSenderApp(
             transactionModal = result
             refreshTrigger++ // Trigger optimistic updates
         }
+    }
+
+    BackHandler(enabled = selectedTab != 0) {
+        selectedTab = 0
     }
 
     Scaffold(
@@ -577,19 +610,40 @@ fun AutoSenderApp(
         }
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
-            when (selectedTab) {
-                0 -> HomeTab(
-                    contacts = contacts,
-                    contactsManager = contactsManager,
-                    logsManager = logsManager,
-                    refreshTrigger = refreshTrigger,
-                    onContactsChanged = { contacts = contactsManager.getContacts() },
-                    showAddContactDialog = showAddContactDialog,
-                    onCloseAddContact = { showAddContactDialog = false },
-                    onSendMoney = onSendMoney
-                )
-                1 -> LogsTab(logsManager = logsManager, refreshTrigger = refreshTrigger)
-                2 -> SettingsTab(themeManager = themeManager, onOpenSettings = onOpenSettings, onLock = onLock)
+            AnimatedContent(
+                targetState = selectedTab,
+                transitionSpec = {
+                    val direction = if (targetState > initialState) 1 else -1
+                    (fadeIn(animationSpec = tween(220)) +
+                        slideInHorizontally(animationSpec = tween(240, easing = FastOutSlowInEasing)) { it / 8 * direction })
+                        .togetherWith(
+                            fadeOut(animationSpec = tween(180)) +
+                                slideOutHorizontally(animationSpec = tween(220, easing = FastOutSlowInEasing)) { -it / 8 * direction }
+                        )
+                },
+                label = "tab_transition"
+            ) { targetTab ->
+                when (targetTab) {
+                    0 -> HomeTab(
+                        contacts = contacts,
+                        allLogs = allLogs,
+                        contactsManager = contactsManager,
+                        logsManager = logsManager,
+                        refreshTrigger = refreshTrigger,
+                        onContactsChanged = { refreshTrigger++ },
+                        showAddContactDialog = showAddContactDialog,
+                        onCloseAddContact = { showAddContactDialog = false },
+                        onSendMoney = onSendMoney,
+                        onOpenSettings = onOpenSettings
+                    )
+                    1 -> LogsTab(
+                        allLogs = allLogs,
+                        contacts = contacts,
+                        logsManager = logsManager,
+                        refreshTrigger = refreshTrigger
+                    )
+                    2 -> SettingsTab(themeManager = themeManager, onOpenSettings = onOpenSettings, onLock = onLock)
+                }
             }
         }
     }
@@ -606,168 +660,268 @@ fun AutoSenderApp(
 @Composable
 fun HomeTab(
     contacts: List<Contact>,
+    allLogs: List<TransactionLog>,
     contactsManager: ContactsManager,
     logsManager: LogsManager,
     refreshTrigger: Int,
     onContactsChanged: () -> Unit,
     showAddContactDialog: Boolean,
     onCloseAddContact: () -> Unit,
-    onSendMoney: (Contact, String) -> Unit
+    onSendMoney: (Contact, String) -> Unit,
+    onOpenSettings: () -> Unit = {}
 ) {
     var editContact by remember { mutableStateOf<Contact?>(null) }
     var selectedContact by remember { mutableStateOf<Contact?>(null) }
+    var quickSendContact by remember { mutableStateOf<Contact?>(null) }
 
-    if (selectedContact != null) {
-        ContactDetailScreen(
-            contact = selectedContact!!,
-            logsManager = logsManager,
-            refreshTrigger = refreshTrigger,
-            onBack = { selectedContact = null },
-            onSend = { amount -> onSendMoney(selectedContact!!, amount) }
-        )
-        return
+    BackHandler(enabled = selectedContact != null) {
+        selectedContact = null
     }
 
-    val totalAllTime = remember(contacts, refreshTrigger) { logsManager.getTotalSentAllTime() }
-    val totalToday = remember(contacts, refreshTrigger) { logsManager.getTotalSentToday() }
-
-    val coroutineScope = rememberCoroutineScope()
-    var isRefreshing by remember { mutableStateOf(false) }
-    val refreshState = rememberPullRefreshState(
-        refreshing = isRefreshing,
-        onRefresh = {
-            isRefreshing = true
-            onContactsChanged()
-            coroutineScope.launch { delay(600); isRefreshing = false }
-        }
-    )
-    
-    var searchQuery by remember { mutableStateOf("") }
-    var visibleItemCount by remember { mutableStateOf(20) }
-    val listState = rememberLazyListState()
-    
-    var isInitialLoad by remember { mutableStateOf(true) }
-    LaunchedEffect(Unit) {
-        delay(800)
-        isInitialLoad = false
-    }
-    
-    val filteredContacts = remember(contacts, searchQuery) {
-        if (searchQuery.isEmpty()) contacts
-        else contacts.filter { it.name.contains(searchQuery, ignoreCase = true) || it.phoneNumber.contains(searchQuery) }
-    }
-    
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
-            .collect { index ->
-                if (index != null && index >= visibleItemCount - 2) {
-                    visibleItemCount += 20
-                }
-            }
-    }
-
-    Box(modifier = Modifier.fillMaxSize().pullRefresh(refreshState)) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // Header
-        val isDark = isSystemInDarkTheme()
-        val headerGradient = if (isDark)
-            Brush.linearGradient(
-                colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
-                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
-            )
-        else
-            Brush.linearGradient(
-                colors = listOf(GradientStart, GradientMid, GradientEnd),
-                start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
-            )
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(headerGradient)
-                .statusBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 20.dp)
-        ) {
-            // Decorative circle top-right
-            Box(
-                modifier = Modifier
-                    .size(180.dp)
-                    .offset(x = 80.dp, y = (-60).dp)
-                    .align(Alignment.TopEnd)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.04f))
-            )
-            Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier.size(8.dp).clip(CircleShape).background(MpesaAccentGreen)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("AutoSender", style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.85f), letterSpacing = 1.sp)
-                }
-                Text("Send Money", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
-                Spacer(modifier = Modifier.height(20.dp))
-                VirtualCreditCard(totalToday = totalToday, totalAllTime = totalAllTime)
+    val lastTxByContactId = remember(allLogs) {
+        val map = HashMap<String, TransactionLog>()
+        for (log in allLogs) {
+            if (log.status == LogStatus.SUCCESS && log.contactId != null && !map.containsKey(log.contactId)) {
+                map[log.contactId] = log
             }
         }
+        map
+    }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            item {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text("Your Contacts (${filteredContacts.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search by name or number...") },
-                    leadingIcon = { Icon(Icons.Default.Search, null) },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp)
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-            }
-            if (isInitialLoad && contacts.isEmpty()) {
-                items(5) {
-                    ShimmerContactCard()
-                }
+    AnimatedContent(
+        targetState = selectedContact,
+        transitionSpec = {
+            if (targetState != null) {
+                (fadeIn(tween(220)) + slideInHorizontally(tween(240, easing = FastOutSlowInEasing)) { it / 6 })
+                    .togetherWith(fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { -it / 6 })
             } else {
-                items(filteredContacts.take(visibleItemCount)) { contact ->
-                    ContactCard(
-                        contact = contact,
-                        logsManager = logsManager,
-                        refreshTrigger = refreshTrigger,
-                        onClick = { selectedContact = contact },
-                        onEdit = { editContact = contact },
-                        onDelete = {
-                            contactsManager.removeContact(contact.id)
-                            onContactsChanged()
-                        }
-                    )
+                (fadeIn(tween(220)) + slideInHorizontally(tween(240, easing = FastOutSlowInEasing)) { -it / 6 })
+                    .togetherWith(fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { it / 6 })
+            }
+        },
+        label = "contact_detail_transition"
+    ) { activeContact ->
+        if (activeContact != null) {
+            ContactDetailScreen(
+                contact = activeContact,
+                allLogs = allLogs,
+                logsManager = logsManager,
+                refreshTrigger = refreshTrigger,
+                onBack = { selectedContact = null },
+                onSend = { amount -> onSendMoney(activeContact, amount) }
+            )
+            return@AnimatedContent
+        }
+
+        val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+        var isAccessibilityEnabled by remember {
+            mutableStateOf((context as? MainActivity)?.isAccessibilityServiceEnabled() ?: true)
+        }
+        DisposableEffect(lifecycleOwner) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    isAccessibilityEnabled = (context as? MainActivity)?.isAccessibilityServiceEnabled() ?: true
                 }
-                if (contacts.isEmpty()) {
-                    item {
-                        EmptyState(
-                            icon = Icons.Default.People,
-                            title = "No Contacts Yet",
-                            subtitle = "Tap the + button to add your first recipient"
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+
+        val totalAllTime = remember(allLogs, refreshTrigger) { LogsManager.calculateTotalSentAllTime(allLogs) }
+        val totalToday = remember(allLogs, refreshTrigger) { LogsManager.calculateTotalSentToday(allLogs) }
+
+        val coroutineScope = rememberCoroutineScope()
+        var isRefreshing by remember { mutableStateOf(false) }
+        val refreshState = rememberPullRefreshState(
+            refreshing = isRefreshing,
+            onRefresh = {
+                isRefreshing = true
+                onContactsChanged()
+                coroutineScope.launch { delay(600); isRefreshing = false }
+            }
+        )
+        
+        var searchQuery by remember { mutableStateOf("") }
+        var visibleItemCount by remember { mutableStateOf(20) }
+        val listState = rememberLazyListState()
+        
+        var isInitialLoad by remember { mutableStateOf(true) }
+        LaunchedEffect(Unit) {
+            delay(800)
+            isInitialLoad = false
+        }
+        
+        val filteredContacts = remember(contacts, searchQuery) {
+            if (searchQuery.isEmpty()) contacts
+            else contacts.filter { it.name.contains(searchQuery, ignoreCase = true) || it.phoneNumber.contains(searchQuery) }
+        }
+        
+        LaunchedEffect(listState) {
+            snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
+                .collect { index ->
+                    if (index != null && index >= visibleItemCount - 2) {
+                        visibleItemCount += 20
+                    }
+                }
+        }
+
+        Box(modifier = Modifier.fillMaxSize().pullRefresh(refreshState)) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // Header
+                val isDark = LocalIsDarkTheme.current
+                val headerGradient = if (isDark)
+                    Brush.linearGradient(
+                        colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
+                        start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+                    )
+                else
+                    Brush.linearGradient(
+                        colors = listOf(GradientStart, GradientMid, GradientEnd),
+                        start = Offset(0f, 0f), end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY)
+                    )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(headerGradient)
+                        .statusBarsPadding()
+                        .padding(horizontal = 20.dp, vertical = 20.dp)
+                ) {
+                    // Decorative circle top-right
+                    Box(
+                        modifier = Modifier
+                            .size(180.dp)
+                            .offset(x = 80.dp, y = (-60).dp)
+                            .align(Alignment.TopEnd)
+                            .clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.04f))
+                    )
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(8.dp).clip(CircleShape).background(MpesaAccentGreen)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("AutoSender", style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.85f), letterSpacing = 1.sp)
+                        }
+                        Text("Send Money", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.ExtraBold)
+                        Spacer(modifier = Modifier.height(20.dp))
+                        VirtualCreditCard(totalToday = totalToday, totalAllTime = totalAllTime)
+                    }
+                }
+
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    if (!isAccessibilityEnabled) {
+                        item(key = "accessibility_banner") {
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable { onOpenSettings() },
+                                colors = CardDefaults.cardColors(containerColor = WarningAmber.copy(alpha = 0.14f)),
+                                shape = RoundedCornerShape(14.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Warning, null, tint = WarningAmber, modifier = Modifier.size(22.dp))
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Accessibility Service Disabled",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            "Tap Enable so AutoSender can automate *334#",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    TextButton(onClick = onOpenSettings) {
+                                        Text("Enable", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    item(key = "search_header") {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Your Contacts (${filteredContacts.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Search by name or number...") },
+                            leadingIcon = { Icon(Icons.Default.Search, null) },
+                            trailingIcon = if (searchQuery.isNotEmpty()) {
+                                { IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Clear, null, modifier = Modifier.size(18.dp)) } }
+                            } else null,
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp)
                         )
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+                    if (isInitialLoad && contacts.isEmpty()) {
+                        items(5) {
+                            ShimmerContactCard()
+                        }
+                    } else {
+                        items(
+                            items = filteredContacts.take(visibleItemCount),
+                            key = { it.id }
+                        ) { contact ->
+                            ContactCard(
+                                contact = contact,
+                                lastTx = lastTxByContactId[contact.id],
+                                modifier = Modifier.animateItem(),
+                                onClick = { selectedContact = contact },
+                                onQuickSend = { quickSendContact = contact },
+                                onEdit = { editContact = contact },
+                                onDelete = {
+                                    contactsManager.removeContact(contact.id)
+                                    onContactsChanged()
+                                }
+                            )
+                        }
+                        if (contacts.isEmpty()) {
+                            item(key = "empty_contacts") {
+                                EmptyState(
+                                    icon = Icons.Default.People,
+                                    title = "No Contacts Yet",
+                                    subtitle = "Tap the + button to add your first recipient"
+                                )
+                            }
+                        }
                     }
                 }
             }
+            PullRefreshIndicator(
+                refreshing = isRefreshing, 
+                state = refreshState, 
+                modifier = Modifier.align(Alignment.TopCenter),
+                backgroundColor = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.primary
+            )
         }
-        }
-        PullRefreshIndicator(
-            refreshing = isRefreshing, 
-            state = refreshState, 
-            modifier = Modifier.align(Alignment.TopCenter),
-            backgroundColor = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.primary
+    }
+
+    if (quickSendContact != null) {
+        val target = quickSendContact!!
+        SendMoneyToContactDialog(
+            contact = target,
+            lastAmount = lastTxByContactId[target.id]?.amount,
+            onDismiss = { quickSendContact = null },
+            onSend = { amount ->
+                onSendMoney(target, amount)
+                quickSendContact = null
+            }
         )
     }
 
@@ -817,6 +971,91 @@ fun HomeTab(
 }
 
 @Composable
+fun SendMoneyToContactDialog(
+    contact: Contact,
+    lastAmount: Double?,
+    onDismiss: () -> Unit,
+    onSend: (String) -> Unit
+) {
+    var amount by remember { mutableStateOf("") }
+    val presets = listOf(100, 200, 500, 1000, 2000)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("Send to ${contact.name}", fontWeight = FontWeight.Bold)
+                Text(contact.phoneNumber, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = amount,
+                    onValueChange = { amount = it },
+                    label = { Text("Amount (KES)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    prefix = { Text("KES ", fontWeight = FontWeight.SemiBold) },
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Text(
+                    "Quick Select",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (lastAmount != null && lastAmount > 0.0) {
+                        val lastFormatted = if (lastAmount % 1.0 == 0.0) lastAmount.toLong().toString() else "%.2f".format(Locale.US, lastAmount)
+                        FilterChip(
+                            selected = amount == lastFormatted,
+                            onClick = { amount = lastFormatted },
+                            label = { Text("Last: KES $lastFormatted", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                    presets.forEach { preset ->
+                        val presetStr = preset.toString()
+                        FilterChip(
+                            selected = amount == presetStr,
+                            onClick = { amount = presetStr },
+                            label = { Text("+$presetStr", style = MaterialTheme.typography.labelSmall) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { if (amount.isNotBlank()) onSend(amount) },
+                enabled = ContactPickerHelper.parseAmount(amount) != null,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Send, null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Send Now", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
 fun StatCard(label: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, modifier: Modifier = Modifier, isDark: Boolean = false) {
     Card(
         modifier = modifier,
@@ -838,15 +1077,13 @@ fun StatCard(label: String, value: String, icon: androidx.compose.ui.graphics.ve
 @Composable
 fun ContactCard(
     contact: Contact,
-    logsManager: LogsManager,
-    refreshTrigger: Int,
+    lastTx: TransactionLog?,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
+    onQuickSend: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val lastTx = remember(contact, refreshTrigger) {
-        logsManager.getLogs().firstOrNull { it.contactId == contact.id && it.status == LogStatus.SUCCESS }
-    }
     val initials = contact.name.split(" ").take(2).joinToString("") { it.firstOrNull()?.toString() ?: "" }.uppercase()
 
     val interactionSource = remember { MutableInteractionSource() }
@@ -863,6 +1100,7 @@ fun ContactCard(
     )
 
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showMoreMenu by remember { mutableStateOf(false) }
 
     // Avatar gradient - each contact gets a deterministic color based on initials
     val avatarHue = (initials.hashCode().and(0xFF) / 255f) * 120f + 90f // greens 90-210
@@ -870,7 +1108,7 @@ fun ContactCard(
     val avatarColor2 = Color.hsv((avatarHue + 30f) % 360f, 0.75f, 0.55f)
 
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .scale(scale)
             .shadow(elevation, RoundedCornerShape(18.dp))
@@ -922,25 +1160,54 @@ fun ContactCard(
                     }
                 }
             }
-            // Action buttons with subtle backgrounds
+            // Primary 1-tap Send button
             IconButton(
-                onClick = onEdit,
+                onClick = onQuickSend,
                 modifier = Modifier
                     .size(44.dp)
                     .clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .background(MaterialTheme.colorScheme.primaryContainer)
             ) {
-                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+                Icon(
+                    Icons.AutoMirrored.Filled.Send,
+                    contentDescription = "Send to ${contact.name}",
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(20.dp)
+                )
             }
-            Spacer(modifier = Modifier.width(8.dp))
-            IconButton(
-                onClick = { showDeleteConfirm = true },
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(ErrorRed.copy(alpha = 0.10f))
-            ) {
-                Icon(Icons.Default.Delete, null, tint = ErrorRed, modifier = Modifier.size(20.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            // More options (Edit / Delete)
+            Box {
+                IconButton(
+                    onClick = { showMoreMenu = true },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "More options", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+                }
+                DropdownMenu(
+                    expanded = showMoreMenu,
+                    onDismissRequest = { showMoreMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Edit Contact") },
+                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                        onClick = {
+                            showMoreMenu = false
+                            onEdit()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete Contact", color = ErrorRed) },
+                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = ErrorRed) },
+                        onClick = {
+                            showMoreMenu = false
+                            showDeleteConfirm = true
+                        }
+                    )
+                }
             }
         }
     }
@@ -970,15 +1237,28 @@ fun ContactCard(
 @Composable
 fun ContactDetailScreen(
     contact: Contact,
+    allLogs: List<TransactionLog>,
     logsManager: LogsManager,
     refreshTrigger: Int,
     onBack: () -> Unit,
     onSend: (String) -> Unit
 ) {
-    val totalAllTime = remember(contact, refreshTrigger) { logsManager.getTotalSentAllTime(contact.id) }
-    val totalToday = remember(contact, refreshTrigger) { logsManager.getTotalSentToday(contact.id) }
-    val contactLogs = remember(contact, refreshTrigger) { logsManager.getLogs().filter { it.contactId == contact.id } }
+    BackHandler(onBack = onBack)
+
+    val contactLogs = remember(allLogs, contact.id, refreshTrigger) {
+        allLogs.filter { it.contactId == contact.id }
+    }
+    val totalAllTime = remember(contactLogs, refreshTrigger) {
+        LogsManager.calculateTotalSentAllTime(contactLogs, contact.id)
+    }
+    val totalToday = remember(contactLogs, refreshTrigger) {
+        LogsManager.calculateTotalSentToday(contactLogs, contact.id)
+    }
+    val lastSuccessAmount = remember(contactLogs) {
+        contactLogs.firstOrNull { it.status == LogStatus.SUCCESS && it.amount != null }?.amount
+    }
     var showSendDialog by remember { mutableStateOf(false) }
+    var selectedLog by remember { mutableStateOf<TransactionLog?>(null) }
     val initials = contact.name.split(" ").take(2).joinToString("") { it.firstOrNull()?.toString() ?: "" }.uppercase()
 
     var filterStatus by remember { mutableStateOf<LogStatus?>(null) }
@@ -1013,7 +1293,7 @@ fun ContactDetailScreen(
     Box(modifier = Modifier.fillMaxSize().pullRefresh(refreshState)) {
         Column(modifier = Modifier.fillMaxSize()) {
             // Gradient Header
-        val isDark = isSystemInDarkTheme()
+        val isDark = LocalIsDarkTheme.current
         val headerGradient = if (isDark)
             Brush.linearGradient(
                 colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
@@ -1122,7 +1402,7 @@ fun ContactDetailScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            item {
+            item(key = "activity_header") {
                 Text("Activity", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.SemiBold)
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1132,9 +1412,20 @@ fun ContactDetailScreen(
                 }
                 Spacer(modifier = Modifier.height(8.dp))
             }
-            items(filteredLogs.take(visibleItemCount)) { log -> LogItemCard(log) }
+            items(
+                items = filteredLogs.take(visibleItemCount),
+                key = { it.id }
+            ) { log ->
+                LogItemCard(
+                    log = log,
+                    modifier = Modifier.animateItem(),
+                    onClick = { selectedLog = log }
+                )
+            }
             if (filteredLogs.isEmpty()) {
-                item { EmptyState(Icons.Default.ReceiptLong, "No Activity", "Transactions will appear here after you send money") }
+                item(key = "empty_activity") {
+                    EmptyState(Icons.AutoMirrored.Filled.ReceiptLong, "No Activity", "Transactions will appear here after you send money")
+                }
             }
         }
         }
@@ -1147,28 +1438,23 @@ fun ContactDetailScreen(
         )
     }
 
+    if (selectedLog != null) {
+        LogDetailDialog(
+            log = selectedLog!!,
+            contactName = contact.name,
+            logsManager = logsManager,
+            onDismiss = { selectedLog = null }
+        )
+    }
+
     if (showSendDialog) {
-        var amount by remember { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = { showSendDialog = false },
-            title = { Text("Send to ${contact.name}", fontWeight = FontWeight.Bold) },
-            text = {
-                OutlinedTextField(
-                    value = amount, onValueChange = { amount = it },
-                    label = { Text("Amount (KES)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(), singleLine = true,
-                    prefix = { Text("KES ", fontWeight = FontWeight.SemiBold) }
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = { if (amount.isNotBlank()) { onSend(amount); showSendDialog = false } },
-                    modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)
-                ) { Text("Send Now", fontWeight = FontWeight.Bold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showSendDialog = false }, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
+        SendMoneyToContactDialog(
+            contact = contact,
+            lastAmount = lastSuccessAmount,
+            onDismiss = { showSendDialog = false },
+            onSend = { amount ->
+                onSend(amount)
+                showSendDialog = false
             }
         )
     }
@@ -1179,18 +1465,19 @@ fun ContactDetailScreen(
 // ─────────────────────────────────────────────
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterialApi::class)
 @Composable
-fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
+fun LogsTab(
+    allLogs: List<TransactionLog>,
+    contacts: List<Contact>,
+    logsManager: LogsManager,
+    refreshTrigger: Int
+) {
     val context = LocalContext.current
-    var allLogs by remember { mutableStateOf(logsManager.getLogs()) }
     var searchQuery by remember { mutableStateOf("") }
     var filterStatus by remember { mutableStateOf<LogStatus?>(null) }
     var selectedLog by remember { mutableStateOf<TransactionLog?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
-
-    LaunchedEffect(refreshTrigger) {
-        allLogs = logsManager.getLogs()
-    }
+    val contactNameById = remember(contacts) { contacts.associate { it.id to it.name } }
     
     val coroutineScope = rememberCoroutineScope()
     var isRefreshing by remember { mutableStateOf(false) }
@@ -1198,7 +1485,6 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
         refreshing = isRefreshing,
         onRefresh = {
             isRefreshing = true
-            allLogs = logsManager.getLogs()
             coroutineScope.launch { delay(600); isRefreshing = false }
         }
     )
@@ -1209,9 +1495,13 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
         isInitialLoad = false
     }
     
-    val filteredLogs = remember(allLogs, searchQuery, filterStatus) {
+    val filteredLogs = remember(allLogs, searchQuery, filterStatus, contactNameById) {
         allLogs.filter { log ->
-            val matchesSearch = searchQuery.isBlank() || log.message.contains(searchQuery, true) || log.contextDetails.contains(searchQuery, true)
+            val contactName = log.contactId?.let { contactNameById[it] } ?: ""
+            val matchesSearch = searchQuery.isBlank() ||
+                log.message.contains(searchQuery, true) ||
+                log.contextDetails.contains(searchQuery, true) ||
+                contactName.contains(searchQuery, true)
             val matchesFilter = filterStatus == null || log.status == filterStatus
             matchesSearch && matchesFilter
         }
@@ -1232,7 +1522,7 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
     Box(modifier = Modifier.fillMaxSize().pullRefresh(refreshState)) {
         Column(modifier = Modifier.fillMaxSize()) {
             // Header
-        val isDark = isSystemInDarkTheme()
+        val isDark = LocalIsDarkTheme.current
         val headerGradient = if (isDark)
             Brush.linearGradient(
                 colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
@@ -1304,7 +1594,7 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
         Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp).padding(top = 16.dp)) {
             OutlinedTextField(
                 value = searchQuery, onValueChange = { searchQuery = it },
-                placeholder = { Text("Search transactions...") },
+                placeholder = { Text("Search recipient or message...") },
                 leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(20.dp)) },
                 trailingIcon = if (searchQuery.isNotEmpty()) {
                     { IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Clear, null, modifier = Modifier.size(18.dp)) } }
@@ -1331,8 +1621,16 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
                         ShimmerLogCard()
                     }
                 } else {
-                    items(filteredLogs.take(visibleItemCount)) { log -> 
-                        LogItemCard(log, onClick = { selectedLog = log }) 
+                    items(
+                        items = filteredLogs.take(visibleItemCount),
+                        key = { it.id }
+                    ) { log ->
+                        LogItemCard(
+                            log = log,
+                            contactName = log.contactId?.let { contactNameById[it] },
+                            modifier = Modifier.animateItem(),
+                            onClick = { selectedLog = log }
+                        )
                     }
                     if (filteredLogs.isEmpty()) {
                         item { EmptyState(Icons.Default.SearchOff, "No Results", "Try adjusting your search or filters") }
@@ -1353,7 +1651,12 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
 
     // Log detail dialog
     if (selectedLog != null) {
-        LogDetailDialog(log = selectedLog!!, onDismiss = { selectedLog = null })
+        LogDetailDialog(
+            log = selectedLog!!,
+            contactName = selectedLog!!.contactId?.let { contactNameById[it] },
+            logsManager = logsManager,
+            onDismiss = { selectedLog = null }
+        )
     }
 
     // ── Clear confirmation dialog ──────────────────────────────────────────
@@ -1381,7 +1684,6 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
                 Button(
                     onClick = {
                         logsManager.clearLogs()
-                        allLogs = emptyList()
                         showClearConfirm = false
                         Toast.makeText(context, "All logs cleared", Toast.LENGTH_SHORT).show()
                     },
@@ -1465,7 +1767,7 @@ fun LogsTab(logsManager: LogsManager, refreshTrigger: Int) {
                                 modifier = Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondaryContainer),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Icon(Icons.Default.TextSnippet, null, tint = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.size(20.dp))
+                                Icon(Icons.AutoMirrored.Filled.TextSnippet, null, tint = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.size(20.dp))
                             }
                             Spacer(modifier = Modifier.width(12.dp))
                             Column {
@@ -1523,7 +1825,12 @@ fun FilterChipItem(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
+fun LogItemCard(
+    log: TransactionLog,
+    contactName: String? = null,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null
+) {
     val statusColor = when (log.status) {
         LogStatus.SUCCESS -> SuccessGreen
         LogStatus.FAILED -> ErrorRed
@@ -1552,7 +1859,7 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
     )
 
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .scale(scale)
             .then(if (onClick != null) Modifier.clickable(interactionSource = interactionSource, indication = null, onClick = onClick) else Modifier),
@@ -1584,11 +1891,13 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
                 Column(modifier = Modifier.weight(1f)) {
                     val logDate = Calendar.getInstance().apply { timeInMillis = log.timestamp }
                     val today = Calendar.getInstance()
+                    val yesterday = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -1) }
                     val dateString = when {
                         logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) -> "Today"
-                        logDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR) - 1 -> "Yesterday"
+                        logDate.get(Calendar.YEAR) == yesterday.get(Calendar.YEAR) && logDate.get(Calendar.DAY_OF_YEAR) == yesterday.get(Calendar.DAY_OF_YEAR) -> "Yesterday"
                         else -> SimpleDateFormat("EEE, MMM dd", Locale.getDefault()).format(Date(log.timestamp))
                     }
+                    val recipientSuffix = if (!contactName.isNullOrBlank()) " · $contactName" else ""
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1596,11 +1905,12 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
                     ) {
                         // Title
                         Text(
-                            if (log.amount != null) "$dateString · KES ${"%.0f".format(log.amount)}" else "$dateString · ${log.message}",
+                            if (log.amount != null) "$dateString · KES ${"%.0f".format(log.amount)}$recipientSuffix" else "$dateString$recipientSuffix · ${log.message}",
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurface,
                             fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         // Status pill badge
@@ -1615,7 +1925,8 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
                     }
                     Spacer(modifier = Modifier.height(3.dp))
                     Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                        Text(log.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                        Text(log.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, modifier = Modifier.weight(1f))
+                        Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(log.timestamp)),
                             style = MaterialTheme.typography.labelSmall,
@@ -1632,7 +1943,12 @@ fun LogItemCard(log: TransactionLog, onClick: (() -> Unit)? = null) {
 }
 
 @Composable
-fun LogDetailDialog(log: TransactionLog, onDismiss: () -> Unit) {
+fun LogDetailDialog(
+    log: TransactionLog,
+    contactName: String? = null,
+    logsManager: LogsManager? = null,
+    onDismiss: () -> Unit
+) {
     val statusColor = when (log.status) {
         LogStatus.SUCCESS -> SuccessGreen
         LogStatus.FAILED -> ErrorRed
@@ -1671,6 +1987,9 @@ fun LogDetailDialog(log: TransactionLog, onDismiss: () -> Unit) {
                         }
                     }
                 }
+                if (!contactName.isNullOrBlank()) {
+                    DetailRow("Recipient", contactName)
+                }
                 // Date/time
                 DetailRow("Date & Time", SimpleDateFormat("EEE, MMM dd yyyy  HH:mm:ss", Locale.getDefault()).format(Date(log.timestamp)))
                 // Message
@@ -1686,6 +2005,45 @@ fun LogDetailDialog(log: TransactionLog, onDismiss: () -> Unit) {
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+                }
+                if (logsManager != null) {
+                    HorizontalDivider()
+                    Text("Manage Record", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.SemiBold)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (log.status == LogStatus.SUCCESS) {
+                            OutlinedButton(
+                                onClick = {
+                                    logsManager.updateLogStatus(log.id, LogStatus.FAILED, "Marked as Failed", log.amount)
+                                    onDismiss()
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Mark Failed", color = ErrorRed, style = MaterialTheme.typography.labelMedium)
+                            }
+                        } else if (log.amount != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    logsManager.updateLogStatus(log.id, LogStatus.SUCCESS, "Marked as Success", log.amount)
+                                    onDismiss()
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Mark Success", color = SuccessGreen, style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                logsManager.deleteLog(log.id)
+                                onDismiss()
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("Delete Log", color = ErrorRed, style = MaterialTheme.typography.labelMedium)
+                        }
                     }
                 }
             }
@@ -1715,9 +2073,26 @@ fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit, onLock: 
     var pin by remember { mutableStateOf(SecurityHelper.getPin(context) ?: "") }
     val currentTheme by themeManager.themeMode.collectAsState()
     var currentTimeoutMs by remember { mutableLongStateOf(LockManager.getTimeoutMs(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isCallGranted by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED)
+    }
+    var isAccessibilityGranted by remember {
+        mutableStateOf((context as? MainActivity)?.isAccessibilityServiceEnabled() == true)
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isCallGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                isAccessibilityGranted = (context as? MainActivity)?.isAccessibilityServiceEnabled() == true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        val isDark = isSystemInDarkTheme()
+        val isDark = LocalIsDarkTheme.current
         val headerGradient = if (isDark)
             Brush.linearGradient(
                 colors = listOf(DarkGradientStart, DarkGradientMid, DarkGradientEnd),
@@ -1768,8 +2143,6 @@ fun SettingsTab(themeManager: ThemeManager, onOpenSettings: () -> Unit, onLock: 
 
             item {
                 SettingsSectionHeader("Permissions")
-                val isCallGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-                val isAccessibilityGranted = (context as? MainActivity)?.isAccessibilityServiceEnabled() == true
                 Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         PermissionRow("Phone Calls", "Required to dial *334# USSD code", isCallGranted) {
@@ -2107,7 +2480,7 @@ fun QuickSendDialog(
     var name by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var amount by remember { mutableStateOf("") }
-    var saveToContacts by remember { mutableStateOf(false) }
+    var saveToContacts by remember { mutableStateOf(true) }
 
     val contactPickerLauncher = rememberLauncherForActivityResult(
         contract = androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
@@ -2157,6 +2530,20 @@ fun QuickSendDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth(), singleLine = true
                 )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(100, 200, 500, 1000, 2000).forEach { preset ->
+                        FilterChip(
+                            selected = amount == preset.toString(),
+                            onClick = { amount = preset.toString() },
+                            label = { Text("+$preset") }
+                        )
+                    }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { saveToContacts = !saveToContacts }) {
                     androidx.compose.material3.Checkbox(
                         checked = saveToContacts,
@@ -2168,16 +2555,23 @@ fun QuickSendDialog(
         },
         confirmButton = {
             Button(onClick = {
-                if (phone.isNotBlank()) {
-                    val finalName = if (name.isNotBlank()) name else "Unknown"
-                    val contactId = java.util.UUID.randomUUID().toString()
-                    val contact = Contact(contactId, finalName, phone)
-                    
-                    if (saveToContacts) {
+                val normalizedPhone = ContactPickerHelper.normalizePhoneNumber(phone)
+                if (normalizedPhone.isNotBlank()) {
+                    val existing = contactsManager.findByPhoneNumber(normalizedPhone)
+                    val finalName = when {
+                        name.isNotBlank() -> name.trim()
+                        existing != null -> existing.name
+                        else -> normalizedPhone
+                    }
+                    val contactId = existing?.id ?: java.util.UUID.randomUUID().toString()
+                    val contact = Contact(contactId, finalName, normalizedPhone)
+
+                    // Always save when in "Save Only" mode (amount is blank), or when "Save to Favorites" is checked
+                    if (saveToContacts || amount.isBlank()) {
                         contactsManager.addContact(contact)
                         onContactsChanged()
                     }
-                    
+
                     if (amount.isNotBlank()) {
                         onSendMoney(contact, amount)
                     }
@@ -2191,6 +2585,16 @@ fun QuickSendDialog(
 
 @Composable
 fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
+    val animatedAllTime by animateFloatAsState(
+        targetValue = totalAllTime.toFloat(),
+        animationSpec = tween(durationMillis = 650, easing = FastOutSlowInEasing),
+        label = "card_all_time"
+    )
+    val animatedToday by animateFloatAsState(
+        targetValue = totalToday.toFloat(),
+        animationSpec = tween(durationMillis = 650, easing = FastOutSlowInEasing),
+        label = "card_today"
+    )
     // Animate a shimmer sweep across the card
     val shimmerTransition = rememberInfiniteTransition(label = "shimmer")
     val shimmerOffset by shimmerTransition.animateFloat(
@@ -2301,7 +2705,7 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "KES %,.2f".format(totalAllTime),
+                        text = "KES %,.2f".format(animatedAllTime.toDouble()),
                         color = Color.White,
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.ExtraBold,
@@ -2334,7 +2738,7 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "KES %,.2f".format(totalToday),
+                            text = "KES %,.2f".format(animatedToday.toDouble()),
                             color = Color.White,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
@@ -2366,7 +2770,7 @@ fun VirtualCreditCard(totalToday: Double, totalAllTime: Double) {
 // ─────────────────────────────────────────────
 @Composable
 fun ShimmerBox(modifier: Modifier = Modifier, cornerRadius: androidx.compose.ui.unit.Dp = 8.dp) {
-    val isDark = isSystemInDarkTheme()
+    val isDark = LocalIsDarkTheme.current
     val baseColor = if (isDark) Color(0xFF2A2A2A) else Color(0xFFE0E0E0)
     val highlightColor = if (isDark) Color(0xFF3A3A3A) else Color(0xFFF5F5F5)
 

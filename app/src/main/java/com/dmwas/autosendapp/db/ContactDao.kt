@@ -6,11 +6,15 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
 import com.dmwas.autosendapp.Contact
+import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface ContactDao {
     @Query("SELECT * FROM contacts")
     fun getAllContacts(): List<Contact>
+
+    @Query("SELECT * FROM contacts")
+    fun getAllContactsFlow(): Flow<List<Contact>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun insertContact(contact: Contact)

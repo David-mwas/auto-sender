@@ -15,9 +15,12 @@
 -keep class com.google.gson.** { *; }
 -keep class com.dmwas.autosendapp.TransactionLog { *; }
 -keep class com.dmwas.autosendapp.Contact { *; }
+-keep class com.dmwas.autosendapp.LogStatus { *; }
 
 # ── Encrypted SharedPreferences / security-crypto ────────────────────────────
 -keep class androidx.security.crypto.** { *; }
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn javax.annotation.**
 
 # ── Biometric ─────────────────────────────────────────────────────────────────
 -keep class androidx.biometric.** { *; }
