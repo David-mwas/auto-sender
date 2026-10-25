@@ -1,6 +1,6 @@
 # AutoSender
 
-AutoSender is an Android application designed to automate the process of sending money via M-PESA. By securely saving your frequent contacts and M-PESA PIN, the app allows you to initiate transfers with a single click, completely bypassing the manual SIM Toolkit flow.
+AutoSender is an Android application designed to automate the process of sending money via M-PESA. By securely saving your frequent contacts, the app allows you to initiate transfers with a single click, completely bypassing the manual SIM Toolkit flow.
 
 ## 🚀 Key Features
 
